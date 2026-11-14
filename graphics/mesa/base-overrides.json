@@ -1,0 +1,14 @@
+[
+  "src/microsoft/compiler/dxil_function.c",
+  "src/microsoft/compiler/dxil_nir_algebraic.py",
+  "src/microsoft/compiler/nir_to_dxil.c",
+  "src/microsoft/vulkan/dzn_cmd_buffer.c",
+  "src/microsoft/vulkan/dzn_descriptor_set.c",
+  "src/microsoft/vulkan/dzn_device.c",
+  "src/microsoft/vulkan/dzn_image.c",
+  "src/microsoft/vulkan/dzn_pipeline.c",
+  "src/microsoft/vulkan/dzn_private.h",
+  "src/microsoft/vulkan/dzn_sync.c",
+  "src/microsoft/vulkan/dzn_util.c",
+  "src/vulkan/wsi/wsi_common_win32.cpp"
+]

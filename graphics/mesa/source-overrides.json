@@ -1,0 +1,84 @@
+{
+  "CUSA00552": [
+    {
+      "file": "dzn_cmd_buffer.c",
+      "sha256": "8c852af305131cc7f5c903219fcaf543adfdff5e5e0d7394f3cd072258cdd75e"
+    },
+    {
+      "file": "dzn_pipeline.c",
+      "sha256": "9f653ce62d63d08e195c285e5edd941cdeaea5266b5b3cc12aa74053ad0f642c"
+    }
+  ],
+  "CUSA00900": [
+    {
+      "file": "dzn_cmd_buffer.c",
+      "sha256": "af9c2e2479604cce9677a651eff71b0bf45ebe6b44fc6ab2dcb90a2c0eaba1dd"
+    },
+    {
+      "file": "dzn_descriptor_set.c",
+      "sha256": "b031bcee71ed51395e2af3678c3208ef248b216fed947d1b8a23e51797d78708"
+    },
+    {
+      "file": "dzn_device.c",
+      "sha256": "787d4f31cf01eb79326625f94584bc31a6c3411dee77ab6701b56f5cc0506d19"
+    },
+    {
+      "file": "dzn_image.c",
+      "sha256": "033838be6a20d8e280617608fe84c253077a64fd82e1e73873f2dadc0e707dbe"
+    },
+    {
+      "file": "dzn_pipeline.c",
+      "sha256": "a2765d71362a928284164516ba7c376b4aea70f089f33ae520b62d6c387643f8"
+    }
+  ],
+  "CUSA02343": [
+    {
+      "file": "dzn_cmd_buffer.c",
+      "sha256": "c4f35193768ff498e4ed8068145fdadcab0f195e99eb22092657fa1dcf565c56"
+    },
+    {
+      "file": "dzn_descriptor_set.c",
+      "sha256": "d3c3951cac427edb10110d55690567bc9a4ee93e8343441c445127a04753c770"
+    },
+    {
+      "file": "dzn_device.c",
+      "sha256": "362f9fc6ddfb250ec4bf13ce516da95f5089a5289340066824f63fa13cb88b95"
+    },
+    {
+      "file": "dzn_image.c",
+      "sha256": "9f802edc3f093808a8d29af665af0d1019f1f8f281a3d080898b0dabb2518cc6"
+    },
+    {
+      "file": "dzn_pipeline.c",
+      "sha256": "db8d0eb9188aba24403d9cc6bb036aa208406c347779467bd7e884edfe2ee104"
+    }
+  ],
+  "CUSA07408": [
+    {
+      "file": "dzn_cmd_buffer.c",
+      "sha256": "cae2a81833a987c17a6951da821766b08d443e57f9a547542d98c030f6197122"
+    },
+    {
+      "file": "dzn_descriptor_set.c",
+      "sha256": "c4db73d1bb1daed13f2e6d50f4009d45065c71ceacfa9dca80fed285e6b7d396"
+    },
+    {
+      "file": "dzn_pipeline.c",
+      "sha256": "9f653ce62d63d08e195c285e5edd941cdeaea5266b5b3cc12aa74053ad0f642c"
+    }
+  ],
+  "CUSA08344": [
+    {
+      "file": "dzn_cmd_buffer.c",
+      "sha256": "cae2a81833a987c17a6951da821766b08d443e57f9a547542d98c030f6197122"
+    },
+    {
+      "file": "dzn_descriptor_set.c",
+      "sha256": "c4db73d1bb1daed13f2e6d50f4009d45065c71ceacfa9dca80fed285e6b7d396"
+    },
+    {
+      "file": "dzn_pipeline.c",
+      "sha256": "9f653ce62d63d08e195c285e5edd941cdeaea5266b5b3cc12aa74053ad0f642c"
+    }
+  ]
+}

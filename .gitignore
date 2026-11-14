@@ -1,0 +1,47 @@
+# Game files, built engines and test runs stay local (never commit game data).
+/package/
+/runs/
+/out/
+/build-local/
+
+# Dated backup copies (git history replaces them) and logs.
+*.before-*
+*.log
+
+# Screenshots in the top folder (game pictures).
+/*.png
+
+# Build output anywhere.
+*.obj
+*.exe
+*.dll
+*.pdb
+*.tlog
+__pycache__/
+
+# Console keys: externally supplied local input, never committed.
+/source/pkg_keys.h
+/local-inputs/
+
+# Keep artwork-generation prompts local.
+/docs/branding/*prompt*
+**/generation-prompt*
+**/NOTES.md
+/notes/
+/internal-notes/
+/.codex/
+/.claude/
+**/CLAUDE.md
+**/AGENTS.md
+**/Pasted text*.txt
+
+# Credentials, signing material, private dumps, and game packages.
+.env
+.env.*
+*.pfx
+*.p12
+*.pem
+*.key
+*.dmp
+*.pkg
+*.psarc

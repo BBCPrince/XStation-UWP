@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "snapshot_date": "2026-11-14",
+  "engines": [
+    {
+      "title_id": "CUSA00552",
+      "name": "The Last of Us Remastered",
+      "source": "engines/CUSA00552",
+      "runtime_file": "tlou-uwp-runtime.dll",
+      "cmake_target": "xstation-runtime",
+      "original_installed_runtime_sha256": "d6af585be164c16dd525e704d605b51b21bee92bfd6b59c87e8d450d739287e1",
+      "original_installed_dozen_sha256": "f618bb0a684104938fc81a16ddbcc93035dc2481cb4212c578942abd5ab77171",
+      "binary_equivalence_claimed": false
+    },
+    {
+      "title_id": "CUSA00900",
+      "name": "Bloodborne",
+      "source": "engines/CUSA00900",
+      "runtime_file": "bb-uwp-runtime.dll",
+      "cmake_target": "xstation-runtime",
+      "original_installed_runtime_sha256": "f0ff2fcb3fb593f5f3391d8877ad5152893516f0348cd87b2320c1361c928081",
+      "original_installed_dozen_sha256": "1aaf3cae1af46c89424c27d9e043816a53eadc956aee11608d225b41477b91d4",
+      "binary_equivalence_claimed": false
+    },
+    {
+      "title_id": "CUSA02343",
+      "name": "Uncharted: The Nathan Drake Collection",
+      "source": "engines/CUSA02343",
+      "runtime_file": "tlou-uwp-runtime.dll",
+      "cmake_target": "xstation-runtime",
+      "original_installed_runtime_sha256": "ea4413368ab3dc3fce8e31b34f2fefd68976146e8097b870b10de31e00a5bffc",
+      "original_installed_dozen_sha256": "54c3e0d46675b4822433cd01618028277554768762fba998411df339e63b23ce",
+      "binary_equivalence_claimed": false
+    },
+    {
+      "title_id": "CUSA07408",
+      "name": "God of War",
+      "source": "engines/CUSA07408",
+      "runtime_file": "tlou-uwp-runtime.dll",
+      "cmake_target": "xstation-runtime",
+      "original_installed_runtime_sha256": "4628d754352d25efab614355df399cb6e4a5754b421828b1b9b22272a6ad7d02",
+      "original_installed_dozen_sha256": "4e554478c38a69f2061f13e679d03eb7542dc2843df40130e87efd33d1e9192e",
+      "binary_equivalence_claimed": false
+    },
+    {
+      "title_id": "CUSA08344",
+      "name": "Detroit: Become Human",
+      "source": "engines/CUSA08344",
+      "runtime_file": "tlou-uwp-runtime.dll",
+      "cmake_target": "xstation-runtime",
+      "original_installed_runtime_sha256": "780eacfeaa6300d59f7c584eb1b81039e632ed7d42d187dabcea1338ebabd649",
+      "original_installed_dozen_sha256": "4e554478c38a69f2061f13e679d03eb7542dc2843df40130e87efd33d1e9192e",
+      "binary_equivalence_claimed": false
+    }
+  ]
+}

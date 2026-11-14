@@ -1,0 +1,56 @@
+{
+  "date": "2026-11-14",
+  "scope": "Local clean source-build and package validation; no new gameplay test",
+  "host_build": "pass",
+  "combined_uwp_package_build": "pass",
+  "package_engine_pairs_verified": 5,
+  "x64_pe_headers_verified": 10,
+  "numeric_preparation_files_sha256_verified": 3,
+  "pkg_header_generator_original_arrays_verified": 16,
+  "engines": [
+    {
+      "title_id": "CUSA00552",
+      "runtime_build": "pass",
+      "mesa_build": "pass",
+      "gameplay_retested": false,
+      "runtime_sha256": "5a765d14810c1fbaaaba8d03444bb0ff5365057a784cb5ae7e786e88f2fef759",
+      "mesa_sha256": "86f99dee5a130a1c460931acf9834d675fec96017454eb3d8feffe6f5958eec5"
+    },
+    {
+      "title_id": "CUSA00900",
+      "runtime_build": "pass",
+      "mesa_build": "pass",
+      "gameplay_retested": false,
+      "runtime_sha256": "0ee535fb46b43dd0a066c1e8b8cf44a56415bd0a6a577015f2a9c6e09951cefb",
+      "mesa_sha256": "2f1d0348cccc050e6c62c8e4bea73f756243a209f85027c8ac664362a7ea3040"
+    },
+    {
+      "title_id": "CUSA02343",
+      "runtime_build": "pass",
+      "mesa_build": "pass",
+      "gameplay_retested": false,
+      "runtime_sha256": "ad59628e75d05187ef5beb9e86bee86024dc692cceff5c7519e79347f3bd2f6c",
+      "mesa_sha256": "058d4c354cbd11bb2eee04a3e8d2069e11de71c926d9fae277e97abe24bb8561"
+    },
+    {
+      "title_id": "CUSA07408",
+      "runtime_build": "pass",
+      "mesa_build": "pass",
+      "gameplay_retested": false,
+      "runtime_sha256": "7446b64ea3a00deb167bd411ea2457e70b8426474ba428c32af32c0593bb7574",
+      "mesa_sha256": "2604be59fbe69dc13b4ca1820f71a8369e033f43ebb49f4a5e6f2b683ceeec03"
+    },
+    {
+      "title_id": "CUSA08344",
+      "runtime_build": "pass",
+      "mesa_build": "pass",
+      "gameplay_retested": false,
+      "runtime_sha256": "6557f747083bb717955dd41a0e46a34f4c67b470fbc679484ebb2b6584a5f1f5",
+      "mesa_sha256": "2604be59fbe69dc13b4ca1820f71a8369e033f43ebb49f4a5e6f2b683ceeec03"
+    }
+  ],
+  "game_data_in_source_or_package": false,
+  "local_bloodborne_patch_input_supplied_for_package_test": true,
+  "binary_equivalence_with_old_installed_build_claimed": false,
+  "upstream_toolchain_dependencies_external": true
+}

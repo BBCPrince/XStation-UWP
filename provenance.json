@@ -1,0 +1,58 @@
+{
+  "review_date": "2026-11-14",
+  "scope": "XStation host, five native runtime source snapshots, local Mesa source replacements, and source-build integration; no game content, generated key-bearing headers, or prebuilt runtime/driver DLLs.",
+  "host_chain": [
+    {
+      "project": "Local Bloodborne UWP host",
+      "file": "src/game_app.cpp",
+      "snapshot_sha256": "7eab1dfa55f368e7129d9067c261df9e30ffb680bb3ae18568923343bb9ab85b",
+      "license_notice": "GPL-2.0-or-later"
+    },
+    {
+      "project": "Local TLOU v1.9.4 UWP host",
+      "relationship": "Adapted from the frozen Bloodborne UWP host reference"
+    },
+    {
+      "project": "XStation",
+      "relationship": "Adapted from the local TLOU host, then maintained in XStation."
+    }
+  ],
+  "preparation_upstream": {
+    "url": "https://github.com/Supermedo/uncharted_pc",
+    "local_revision_inspected": "8b66edc0192ea246ca63b360857402a0aa55626d",
+    "files": [
+      "scripts/prepare.py",
+      "scripts/link_modules.py",
+      "scripts/content_profile.py"
+    ],
+    "local_modifications": true
+  },
+  "pkg_reader_upstream": {
+    "url": "https://github.com/pearlxcore/OrbisPkgTool",
+    "local_revision_inspected": "5cd42a515dc29a453c7abcb93318493bdb5b5e1f",
+    "license": "MIT"
+  },
+  "native_cache": {
+    "source": "Local Spider-Man native compiler cache adaptation",
+    "public_upstream_revision": "Not established; do not represent this as unmodified upstream code"
+  },
+  "limitations": [
+    "The host snapshot hashes establish the local copy chain, not sole authorship or trademark clearance.",
+    "The exact upstream revision of every pre-XStation local modification has not been reconstructed.",
+    "No full binary-distribution compliance audit is claimed."
+  ],
+  "source_layout_revision": "2026-11-14: C++ host moved from host/src to source; native runtime and graphics sources included.",
+  "runtime_source_export": {
+    "date": "2026-11-14",
+    "manifest": "engines/manifest.json",
+    "snapshot_kind": "Local working source snapshots; original file notices preserved",
+    "build_recipe_changes": "CMake retargeted to the title UWP DLLs, desktop/test executables omitted, missing later frame-generation integration retained",
+    "binary_equivalence_claimed": false
+  },
+  "mesa_source": {
+    "url": "https://archive.mesa3d.org/mesa-26.2.4.tar.xz",
+    "sha256": "bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9",
+    "local_changes": "graphics/mesa/common and graphics/mesa/titles",
+    "override_manifest": "graphics/mesa/source-overrides.json"
+  }
+}
