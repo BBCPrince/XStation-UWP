@@ -12,14 +12,16 @@ XStation provides a console dashboard, game details and settings, USB discovery,
 
 Recorded **Xbox Series X Developer Mode** results from earlier development binaries; **no full campaign or Series S result is verified**. The newly source-built binaries have passed build/package checks only. FPS varies by scene and settings.
 
-| Game | Recorded FPS | Verified progress |
-| --- | --- | --- |
-| Bloodborne 1.09 | **58–60**, 540p, dynamic shadows off | Saved character, movement/menus, Hunter's Dream |
-| The Last of Us Remastered | **25–30** in recorded XStation checks; 30 cap | Menus and in-game saved checkpoints; chapter completion not established |
-| Uncharted 1: Drake's Fortune (Nathan Drake Collection) | **30 capped**; **58–59 average uncapped** on early boat deck | Early jungle and boat-deck gameplay |
-| God of War (2018) | **16–18**, later standalone development build | Opening gameplay / axe-swing prompt; later trial not integrated into packaged engine |
-| Detroit: Become Human | **About 28 average**, later tuned development build | Chapter 1: The Hostage tutorial/hallway; packaged snapshot differs |
-| Uncharted 2 / Uncharted 3 | Not measured | Gameplay not verified |
+| Game | Tested game version | Recorded FPS | Verified progress |
+| --- | --- | --- | --- |
+| Bloodborne | **1.09** | **58–60**, 540p, dynamic shadows off | Saved character, movement/menus, Hunter's Dream |
+| The Last of Us Remastered | **1.00** (base game) | **25–30** in recorded XStation checks; 30 cap | Menus and in-game saved checkpoints; chapter completion not established |
+| Uncharted 1: Drake's Fortune (Nathan Drake Collection) | **1.00** (base collection) | **30 capped**; **58–59 average uncapped** on early boat deck | Early jungle and boat-deck gameplay |
+| God of War (2018) | **1.35** | **16–18**, later standalone development build | Opening gameplay / axe-swing prompt; later trial not integrated into packaged engine |
+| Detroit: Become Human | **1.00** (base game) | **About 28 average**, later tuned development build | Chapter 1: The Hostage tutorial/hallway; packaged snapshot differs |
+| Uncharted 2 / Uncharted 3 | Not verified | Not measured | Gameplay not verified |
+
+Use the listed game version and matching title ID from the [compatibility list](docs/COMPATIBILITY.md). Other updates or regions are unverified and may fail preparation. These are game versions, separate from XStation's own app version.
 
 These are scene-specific results, not whole-game FPS guarantees. TLOU's optional frame-generated output is separate from real game FPS. See the **[full compatibility list](docs/COMPATIBILITY.md)** for settings, test references, known limits and build differences.
 
