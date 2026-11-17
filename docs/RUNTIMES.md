@@ -63,7 +63,7 @@ For separate staging/build steps:
 .\build\build-launcher.ps1 -RuntimeStage "$PWD\out\runtime-stage"
 ```
 
-No game data is assembled by these commands. Bloodborne on-console preparation additionally expects the matching locally supplied `patches.bin` profile, SHA-256 `3bcde5d4485ba7b129550243740d3c377572669c6c7e8a6aa9d7d9ca2db7cd6f`; supply `-BloodbornePatchFile <path>` to `build-all.ps1` or `stage-runtimes.ps1`. This game-specific input is excluded from GitHub. The title runtime itself builds without it. Existing owned/prepared game folders remain external inputs as well. Detroit has runtime source but still has no on-console preparation recipe, as before this source export.
+No game data is assembled by these commands. Bloodborne on-console preparation additionally expects the matching locally supplied `patches.bin` profile, SHA-256 `3bcde5d4485ba7b129550243740d3c377572669c6c7e8a6aa9d7d9ca2db7cd6f`; supply `-BloodbornePatchFile <path>` to `build-all.ps1` or `stage-runtimes.ps1`. This game-specific input is excluded from GitHub. The title runtime itself builds without it. Existing owned/prepared game folders remain external inputs as well. The host also includes a Detroit 1.00 on-console preparation recipe.
 
 ## Validation and licensing
 

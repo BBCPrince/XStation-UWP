@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cctype>
 #include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <unordered_map>
 #include <cwctype>
 #include <fstream>
 #include <thread>
@@ -657,6 +660,10 @@ private:
             return memcmp(h, &data[32 + i * 32], 32) == 0;
         };
         for (int i = 0; i < 7; ++i) if (matches(i, dk_[i])) return true;
+#ifdef XSTATION_PUBLIC
+        err = L"This PKG isn't a fake PKG (an official Sony package, or one with its own passcode). XStation converts fake PKGs only.";
+        return false;
+#else
         std::vector<uint8_t> recovered;
         if (data.size() >= 32 + 7 * 32 + 4 * 256 &&
             RsaDecrypt(kDerivedKey3Modulus, kDerivedKey3D, kDerivedKey3P, kDerivedKey3Q, kDerivedKey3DP, kDerivedKey3DQ, kDerivedKey3InverseQ,
@@ -666,6 +673,7 @@ private:
         }
         err = L"This PKG uses a passcode or keys XStation doesn't have (a retail or custom-key package).";
         return false;
+#endif
     }
 
     // EKPFS from IMAGE_KEY (AES-CBC with dk3, then RSA with the fake key set); then the outer PFS, pfs_image.dat in it, the
@@ -791,6 +799,41 @@ bool MakeParents(const std::wstring& path) {
     }
     return true;
 }
+
+// 2026-11-14: every file under <dir> with its size, by lower-case full path (one listing per folder, not a lookup per file).
+void ListFiles(const std::wstring& dir, std::unordered_map<std::wstring, uint64_t>& out) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE f = FindFirstFileExFromAppW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        const std::wstring path = dir + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { ListFiles(path, out); continue; }
+        std::wstring key = path;
+        for (wchar_t& c : key) c = (wchar_t)towlower(c);
+        out[key] = (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+}
+
+// 2026-11-14: MakeParents, but each folder only once per conversion (it cost a call per level per file).
+struct Folders {
+    std::set<std::wstring> made;
+    bool For(const std::wstring& path) {
+        const size_t last = path.find_last_of(L'\\');
+        if (last == std::wstring::npos || made.count(path.substr(0, last))) return true;
+        for (size_t at = path.find(L'\\', 3); at != std::wstring::npos && at <= last; at = path.find(L'\\', at + 1)) {
+            const std::wstring dir = path.substr(0, at);
+            if (made.count(dir)) continue;
+            if (!CreateDirectoryFromAppW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+                WIN32_FILE_ATTRIBUTE_DATA a{};
+                if (!GetFileAttributesExFromAppW(dir.c_str(), GetFileExInfoStandard, &a) || !(a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+            }
+            made.insert(dir);
+        }
+        return true;
+    }
+};
 
 // Writes through a 4 MiB buffer into <path>.part, renamed when complete.
 struct Writer {
@@ -928,7 +971,8 @@ bool PkgReadParams(const std::wstring& path, PkgParams& out, std::wstring& error
 }
 
 bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& outDir, PkgProgress* progress,
-                    const std::atomic<bool>* cancel, bool resume, std::wstring& error, uint64_t freeBytes, PkgShrink* shrink) {
+                    const std::atomic<bool>* cancel, bool resume, std::wstring& error, uint64_t freeBytes, PkgShrink* shrink,
+                    bool rewriteUpdates) {
     if (!Alg().ok) { error = L"Windows' crypto functions couldn't be opened."; return false; }
     // A shrinking convert that already cut these PKGs left <game folder>\.xstation-shrink: "<size before>\t<file name>" lines.
     const std::wstring statePath = outDir.substr(0, outDir.find_last_of(L'\\')) + L"\\.xstation-shrink";
@@ -996,10 +1040,15 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
         std::replace(dest.begin(), dest.end(), L'/', L'\\');
         return dest;
     };
+    // Files already there from an earlier, stopped run: listed once (2026-11-14: was a lookup per file, twice).
+    std::unordered_map<std::wstring, uint64_t> existing;
+    if (resume) ListFiles(outDir, existing);
     auto present = [&](const Item& it) {
-        WIN32_FILE_ATTRIBUTE_DATA a{};
-        return resume && GetFileAttributesExFromAppW(destOf(it).c_str(), GetFileExInfoStandard, &a) &&
-               ((uint64_t(a.nFileSizeHigh) << 32) | a.nFileSizeLow) == it.size;
+        if (!resume || (rewriteUpdates && !forced && it.pkg > 0)) return false;
+        std::wstring key = destOf(it);
+        for (wchar_t& c : key) c = (wchar_t)towlower(c);
+        const auto e = existing.find(key);
+        return e != existing.end() && e->second == it.size;
     };
     uint64_t total = 0, needed = 0;
     for (const auto& [key, it] : plan) {
@@ -1078,36 +1127,38 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
     if (progress) { progress->total = total; progress->filesTotal = (uint32_t)plan.size(); }
 
     std::vector<uint8_t> block(kBlock);
+    Folders folders;
+    // One planned file's bytes from the PKG, in order, to `sink`.
+    auto readItem = [&](const Item& it, const std::function<bool(const uint8_t*, size_t)>& sink) -> bool {
+        Pkg& pkg = *pkgs[it.pkg];
+        if (it.sc0) return pkg.CopyEntry(pkg.entries[it.index], [&](const uint8_t* p, size_t n) {
+            if (progress) progress->done += n;
+            return sink(p, n);
+        }, cancel);
+        const Inode* ino = pkg.inner.Get(it.index);
+        std::vector<int64_t> blocks;
+        if (!ino || !pkg.inner.Blocks(*ino, blocks)) return false;
+        uint64_t left = ino->size;
+        for (size_t b = 0; b < blocks.size() && left; ++b) {
+            if (blocks[b] <= 0) break;
+            if ((cancel && *cancel) || !pkg.inner.ReadBlock(blocks[b], block.data())) return false;
+            const size_t n = (size_t)std::min<uint64_t>(kBlock, left);
+            if (!sink(block.data(), n)) return false;
+            left -= n;
+            if (progress) progress->done += n;
+        }
+        return !left;
+    };
     // One planned file into <dest>.part, then renamed.
     auto extract = [&](const Item& it) -> bool {
         const std::wstring dest = destOf(it);
-        if (!MakeParents(dest)) { error = L"Couldn't make the folder for " + Wide(it.path) + L"."; return false; }
+        if (!folders.For(dest)) { error = L"Couldn't make the folder for " + Wide(it.path) + L"."; return false; }
         const std::wstring part = dest + L".part";
         bool ok;
         {
             Writer w;
             if (!w.Open(part)) { error = L"Couldn't write " + Wide(it.path) + L" (error " + std::to_wstring(GetLastError()) + L")."; return false; }
-            Pkg& pkg = *pkgs[it.pkg];
-            if (it.sc0) {
-                ok = pkg.CopyEntry(pkg.entries[it.index], [&](const uint8_t* p, size_t n) {
-                    if (progress) progress->done += n;
-                    return w.Write(p, n);
-                }, cancel);
-            } else {
-                const Inode* ino = pkg.inner.Get(it.index);
-                std::vector<int64_t> blocks;
-                ok = ino && pkg.inner.Blocks(*ino, blocks);
-                uint64_t left = ino ? ino->size : 0;
-                for (size_t b = 0; ok && b < blocks.size() && left; ++b) {
-                    if (blocks[b] <= 0) break;
-                    if ((cancel && *cancel) || !pkg.inner.ReadBlock(blocks[b], block.data())) { ok = false; break; }
-                    const size_t n = (size_t)std::min<uint64_t>(kBlock, left);
-                    if (!w.Write(block.data(), n)) { ok = false; break; }
-                    left -= n;
-                    if (progress) progress->done += n;
-                }
-                if (left) ok = false;
-            }
+            ok = readItem(it, [&](const uint8_t* p, size_t n) { return w.Write(p, n); });
             ok = ok && w.Flush();
         }
         if (ok) DeleteFileFromAppW(dest.c_str()); // MoveFileFromAppW doesn't replace
@@ -1121,16 +1172,93 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
     };
 
     if (!shrinking) {
+        // 2026-11-14: games with many small files (God of War: 57,418 files, 55,789 under 1 MB, 12,360 in one folder)
+        // crawled on a USB drive, about 5 files a second: on the Xbox every file call goes through the broker, and each
+        // file cost about 11 (a CreateDirectory per folder level, a lookup twice, .part, delete, rename). Now folders
+        // are made once, files on hand are listed once, and files up to 8 MiB are read here and written straight to
+        // their name by 8 writer threads (a stopped one is short, so a resumed run writes it again). Bigger files still
+        // go through .part.
+        constexpr size_t kSmall = 8u << 20, kInFlight = 256u << 20, kWriters = 8;
+        struct Small { std::wstring dest; std::string path; std::vector<uint8_t> data; };
+        std::mutex lock;
+        std::condition_variable work, room;
+        std::deque<Small> queue;
+        size_t inFlight = 0;
+        bool closing = false;
+        std::wstring writeError;
+        auto writer = [&] {
+            for (;;) {
+                Small f;
+                {
+                    std::unique_lock<std::mutex> l(lock);
+                    work.wait(l, [&] { return closing || !queue.empty(); });
+                    if (queue.empty()) return;
+                    f = std::move(queue.front());
+                    queue.pop_front();
+                }
+                bool ok = false;
+                DWORD why = 0;
+                HANDLE h = CreateFile2FromAppW(f.dest.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    DWORD wrote = 0;
+                    ok = f.data.empty() || (WriteFile(h, f.data.data(), DWORD(f.data.size()), &wrote, nullptr) && wrote == f.data.size());
+                    if (!ok) why = GetLastError();
+                    CloseHandle(h);
+                    if (!ok) DeleteFileFromAppW(f.dest.c_str());
+                } else why = GetLastError();
+                if (ok && progress) ++progress->files;
+                {
+                    std::lock_guard<std::mutex> l(lock);
+                    inFlight -= f.data.size();
+                    if (!ok && writeError.empty())
+                        writeError = L"Couldn't write " + Wide(f.path) + L" (error " + std::to_wstring(why) + L"). The drive may be full or unplugged.";
+                }
+                room.notify_all();
+            }
+        };
+        std::vector<std::thread> pool;
+        for (size_t i = 0; i < kWriters; ++i) pool.emplace_back(writer);
+        auto finish = [&](bool ok) {
+            {
+                std::lock_guard<std::mutex> l(lock);
+                closing = true;
+            }
+            work.notify_all();
+            for (auto& t : pool) t.join();
+            if (ok && !writeError.empty()) { error = writeError; return false; }
+            return ok;
+        };
         for (const auto& key : order) {
             const Item& it = plan[key];
-            if (cancel && *cancel) { error = L"Stopped."; return false; }
+            if (cancel && *cancel) { error = L"Stopped."; return finish(false); }
+            {
+                std::lock_guard<std::mutex> l(lock);
+                if (!writeError.empty()) break;
+            }
             if (present(it)) {
                 if (progress) { progress->done += it.size; ++progress->files; }
                 continue;
             }
-            if (!extract(it)) return false;
+            if (it.size > kSmall) {
+                if (!extract(it)) return finish(false);
+                continue;
+            }
+            Small f{destOf(it), it.path, {}};
+            if (!folders.For(f.dest)) { error = L"Couldn't make the folder for " + Wide(it.path) + L"."; return finish(false); }
+            f.data.reserve((size_t)it.size);
+            if (!readItem(it, [&](const uint8_t* p, size_t n) { f.data.insert(f.data.end(), p, p + n); return true; })) {
+                error = (cancel && *cancel) ? L"Stopped." : L"Couldn't extract " + Wide(it.path) + L". The PKG may be damaged.";
+                return finish(false);
+            }
+            {
+                std::unique_lock<std::mutex> l(lock);
+                room.wait(l, [&] { return inFlight == 0 || inFlight + f.data.size() <= kInFlight || !writeError.empty(); });
+                inFlight += f.data.size();
+                queue.push_back(std::move(f));
+            }
+            work.notify_one();
         }
-        return true;
+        return finish(true);
     }
 
     // Shrinking. Files already there (resumed) count as done.

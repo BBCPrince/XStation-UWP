@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <tuple>
 #include "game_prepare.h"
+#include "tlou_assets.h"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -764,6 +765,8 @@ const Recipe kRecipes[] = {
     // Bloodborne 1.09
     {L"CUSA00900", "b5cb1da3a15bb853c2adbc9ef03d7d8058f729b247a0646370cf61f056398e1d", false, false, nullptr, 0, 0, 0,
      L"GameData109", L"GameBoot109", L"redzone-memory-sites.bin", "606d17d1a82cab5a07cff3c3e89d81b588229b4ebf069a9d07720b5445834352", true},
+    // Detroit: Become Human 1.00 (2026-11-14; the PC port's out/boot-linked.bin of 2026-11-08, no red-zone sites)
+    {L"CUSA08344", "23e1b2e1ceb22da730c23f7757872a01f7b8913f68aa386352fa7b7710346419", false, false, nullptr},
 };
 const Recipe* FindRecipe(const std::wstring& title) {
     for (const auto& r : kRecipes) if (title == r.title) return &r;
@@ -863,6 +866,10 @@ bool GamePrepare(const std::wstring& titleId, const std::wstring& gameFolder, co
     bool ok = WriteAll(out + L"\\content.bin", content);
     if (recipe->guardSites) ok = ok && WriteAll(out + L"\\boot-memory.bin", memory);
     for (const auto& [name, data] : patches) ok = ok && WriteAll(out + L"\\" + name, data);
+    // 2026-11-14: The Last of Us's reduced home textures and shader packs, made here from the game's own files (a fresh
+    // convert has the full textures and no packs), before boot-linked.bin so the game can't start halfway through.
+    if (ok && titleId == L"CUSA00552") TlouPrepareAssets(gameFolder, detail);
+    if (ok && titleId == L"CUSA02343") UnchartedTrimTextures(gameFolder, detail);  // Uncharted's trimmed dictionaries, likewise
     ok = ok && WriteAll(out + L"\\boot-linked.bin", boot); // last: the dashboard treats this file as "prepared"
     if (!ok) { error = L"Couldn't write the prepared image."; return false; }
     return true;

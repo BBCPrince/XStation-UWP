@@ -68,6 +68,7 @@
 #include "cxx_imports.h"
 #include "dashboard.h"
 #include "usb_files.h"
+#include "tlou_assets.h"
 #include <map>
 #include <ctime>
 #include <vector>
@@ -295,14 +296,14 @@ void InitializeRuntime() {
         Log(std::string("fsr_upscale=")+(upscale==1?"fsr3":upscale==0?"off":"ini"));
     }
     // XStation (2026-11-13): "CPU On / Off" on the game page writes cpu-counter.txt = 1 or 0: the engine's FPS and CPU
-    // box (show_fps in this title's bbport.ini; every engine reads BB_CONFIG). No file: on.
+    // box (show_fps in this title's bbport.ini; every engine reads BB_CONFIG). No file: off (2026-11-15, user).
     {
         const std::wstring ini=localPath+L"\\bbport.ini";
         if (_putenv_s("BB_CONFIG",to_string(ini).c_str())!=0) { loadError=ERROR_INVALID_DATA; phase=3; return; }
         check_bool(SetEnvironmentVariableW(L"BB_CONFIG",ini.c_str()));
         std::ifstream choiceFile(localPath+L"\\cpu-counter.txt");
-        int choice=1; // 2026-11-14 (user): on for every game unless the game page turned it off
-        { int value=1; if (choiceFile>>value) choice=value; }
+        int choice=0; // 2026-11-15 (user): off for every game unless the game page turned it on
+        { int value=0; if (choiceFile>>value) choice=value; }
         if (choice==0 || choice==1) {
             std::string kept;
             {
@@ -636,6 +637,8 @@ struct App : ApplicationT<App> {
     std::mutex textMutex;
     std::atomic<int> textState{0}; // 0 idle, 1 visible/pending, 2 confirmed, 3 cancelled
     std::string textResult;
+    ContentDialog textDialog{nullptr};          // the prompt on screen (UI thread)
+    std::atomic<bool> textForceConfirm{false};  // dev build: developer-input confirmed it
 
     void ClearKeyboard() { keys=0; keyboardButtons=0; keyboardPressed=0; }
 
@@ -668,7 +671,11 @@ struct App : ApplicationT<App> {
             dialog.Opened([input](const auto&,const auto&) {
                 input.Focus(FocusState::Programmatic); input.SelectAll();
             });
-            if (co_await dialog.ShowAsync()==ContentDialogResult::Primary) {
+            textDialog=dialog;
+            textForceConfirm=false;
+            const auto shown=co_await dialog.ShowAsync();
+            textDialog=nullptr;
+            if (shown==ContentDialogResult::Primary || textForceConfirm.exchange(false)) {
                 result=to_string(input.Text()); resultState=2;
             }
         } catch (const hresult_error& error) {
@@ -905,6 +912,20 @@ struct App : ApplicationT<App> {
                     developer.close(); // Release the read handle before consuming the command.
                     DeleteFileW((localPath+L"\\developer-input.txt").c_str());
                     Log("developer_input_nonce="+std::to_string(request.nonce)+"; duration="+std::to_string(request.duration)+"; buttons="+std::to_string(request.buttons));
+#ifndef XSTATION_PUBLIC
+                    // 2026-11-16 (dev build only): 0x10000 presses Confirm on XStation's own prompt (the save-slot
+                    // dialog is a XAML ContentDialog that takes real controller input, not this file's pad).
+                    if (testInput.buttons & 0x10000u) {
+                        testInput.buttons &= ~0x10000u;
+                        if (textState.load()==1) {
+                            textForceConfirm=true;
+                            auto lifetime=get_strong();
+                            gamePanel.Dispatcher().RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal,
+                                [lifetime] { if (lifetime->textDialog) lifetime->textDialog.Hide(); });
+                            Log("developer_input_confirms_text_dialog=true");
+                        }
+                    }
+#endif
                 }
             }
         }
@@ -1197,11 +1218,13 @@ struct App : ApplicationT<App> {
                 endHandlerAdded=true;
                 const auto add=reinterpret_cast<PVOID(WINAPI*)(ULONG,PVECTORED_EXCEPTION_HANDLER)>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"AddVectoredExceptionHandler"));
                 if(add) add(0,EndOnFatal);
+#ifndef XSTATION_PUBLIC
                 std::ifstream keep(localPath+L"\\dev-keep-crashed.txt");
                 keepCrashedProcess=keep.is_open();
                 std::ifstream crash(localPath+L"\\dev-heap-crash.txt");
                 unsigned seconds=0;
                 if(crash>>seconds){ crash.close(); DeleteFileW((localPath+L"\\dev-heap-crash.txt").c_str()); devCrashAt=tick+seconds*1000ull; Log("dev_heap_crash_in="+std::to_string(seconds)); }
+#endif
             }
             if(devCrashAt&&tick>=devCrashAt){ devCrashAt=0; DevHeapCrash(); }
         }
@@ -1353,11 +1376,42 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
             std::ofstream icd(gameFolder+L"\\dzn_icd.x86_64.json",std::ios::trunc);
             icd<<"{\n  \"file_format_version\": \"1.0.0\",\n  \"ICD\": {\n    \"library_path\": \""<<json<<"\",\n    \"api_version\": \"1.1.354\"\n  }\n}\n";
         }
+        // 2026-11-14: shader packs made at prepare time sit in the game's folder (internal or USB); a bb-env.txt
+        // BB_SHADER_PREBUILD line, applied later by the engine, still wins.
+        if(GetFileAttributesW((gameFolder+L"\\shader-packs\\areas.txt").c_str())!=INVALID_FILE_ATTRIBUTES){
+            const auto packs=gameFolder+L"\\shader-packs";
+            _putenv_s("BB_SHADER_PREBUILD",to_string(packs).c_str());
+            SetEnvironmentVariableW(L"BB_SHADER_PREBUILD",packs.c_str());
+            Log("shader_packs="+to_string(packs));
+        }
+        // 2026-11-16: a pipeline recipe shipped with the engine (tools/tlou_recipe.py: which shaders and settings the
+        // game used, no shader code); the pre-builder builds those exact setups from the game's own shader packs.
+        // A bb-env.txt BB_SHADER_RECIPE line (a path, or 0 for off) still wins.
+        {
+            const auto recipe=installed+L"\\"+enginePath+L"\\pipelines.recipe";
+            if(GetFileAttributesW(recipe.c_str())!=INVALID_FILE_ATTRIBUTES){
+                _putenv_s("BB_SHADER_RECIPE",to_string(recipe).c_str());
+                SetEnvironmentVariableW(L"BB_SHADER_RECIPE",recipe.c_str());
+                Log("shader_recipe="+to_string(recipe));
+            }
+        }
+        // 2026-11-14: Uncharted's runtime mip-skip only on untrimmed dictionaries (both at once would be blurrier); a
+        // bb-env.txt BB_TEXTURE_MIP_SKIP line still wins.
+        if(titleId==L"CUSA02343"){
+            const bool trimmed=UnchartedTrimmed(gameFolder);
+            _putenv_s("BB_TEXTURE_MIP_SKIP",trimmed?"0":"1");
+            SetEnvironmentVariableW(L"BB_TEXTURE_MIP_SKIP",trimmed?L"0":L"1");
+            Log(std::string("uncharted_textures=")+(trimmed?"trimmed; mip_skip=0":"original; mip_skip=1"));
+        }
         // First run of this game: the engine's tested settings (never over the user's own).
         const std::wstring defaults=installed+L"\\"+enginePath+L"\\defaults";
         COPYFILE2_EXTENDED_PARAMETERS keepExisting{sizeof(keepExisting)};
         keepExisting.dwCopyFlags=COPY_FILE_FAIL_IF_EXISTS;
         CopyFile2((defaults+L"\\bb-env.txt").c_str(),(localPath+L"\\tlou-bb194-user\\bb-env.txt").c_str(),&keepExisting);
+        // 2026-11-14: the engine reads worker-yield-mode.txt (idle workers yield instead of spinning) from its
+        // user folder, not from here, so a default one goes there too (The Last of Us: 2 = Sleep(1), about 6 to
+        // 2.5 cores busy at the same 30 FPS).
+        CopyFile2((defaults+L"\\worker-yield-mode.txt").c_str(),(localPath+L"\\tlou-bb194-user\\worker-yield-mode.txt").c_str(),&keepExisting);
         // XStation (2026-11-08): every other file there too (The Last of Us has about 40 switch files,
         // Bloodborne its layout and ini, God of War draw-pipeline-off.txt).
         {

@@ -20,6 +20,8 @@ To use an existing header, pass `-PkgKeysDirectory <folder containing pkg_keys.h
 
 Expected executable: `out/build/Release/XStation.exe`. Build output and private inputs are ignored by Git.
 
+The host defaults to `XSTATION_PUBLIC=ON`: fake-PKG-only conversion, with development switches disabled. The generated header stays local and is not distributed with source.
+
 ## Direct CMake / Visual Studio
 
 ```powershell

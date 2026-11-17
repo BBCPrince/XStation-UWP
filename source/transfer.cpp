@@ -33,6 +33,9 @@ std::atomic<int> conversions{0};
 std::mutex convertedLock;
 std::wstring convertedId, convertedTarget, lastPkgMessage;
 bool convertedUpdate = false;
+// 2026-11-14: why the last Wi-Fi PKG stopped (empty while one runs or after a good one). A refusal reaches the
+// browser while it is still sending, so it sees only "connection lost"; the page asks /pkgresult for the reason.
+std::wstring lastPkgError;
 
 const char kPage[] = R"HTML(<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XStation transfer</title>
 <style>
@@ -50,13 +53,27 @@ progress{width:100%;height:14px;margin-top:6px}#status{font-size:14px;word-break
 <script>
 const $=id=>document.getElementById(id);let busy=false;
 function fmt(n){return n>=1073741824?(n/1073741824).toFixed(2)+" GB":(n/1048576).toFixed(1)+" MB"}
+// 2026-11-14: the PKG's title ID and category (header + param.sfo), so the Xbox can say no before anything is sent.
+async function pkgInfo(f){try{const h=new DataView(await f.slice(0,4096).arrayBuffer());if(h.byteLength<0x64||h.getUint32(0)!=0x7F434E54)return null;
+ const n=h.getUint32(0x10),t=h.getUint32(0x18);if(n>100000)return null;const tb=new DataView(await f.slice(t,t+n*32).arrayBuffer());let o=-1,z=0;
+ for(let i=0;i*32+32<=tb.byteLength;i++)if(tb.getUint32(i*32)==0x1000){o=tb.getUint32(i*32+16);z=tb.getUint32(i*32+20);break}
+ const info={id:new TextDecoder().decode(new Uint8Array(h.buffer,0x40,36)).substr(7,9),cat:"",title:""};if(o<0||z<20||z>1048576)return info;
+ const s=new DataView(await f.slice(o,o+z).arrayBuffer());if(s.byteLength<20||s.getUint32(0)!=0x00505346)return info;z=s.byteLength;
+ const str=(p,l)=>{const a=new Uint8Array(s.buffer,p,Math.min(l,z-p));const e=a.indexOf(0);return new TextDecoder().decode(e<0?a:a.subarray(0,e))};
+ const k=s.getUint32(8,true),v=s.getUint32(12,true),c=s.getUint32(16,true);
+ for(let i=0;i<c&&20+i*16+16<=z;i++){const e=20+i*16,key=k+s.getUint16(e,true),fm=s.getUint16(e+2,true),len=s.getUint32(e+4,true),val=v+s.getUint32(e+12,true);
+  if(key>=z||fm!=0x0204||val+len>z)continue;const name=str(key,z),text=str(val,len);if(name=="CATEGORY")info.cat=text;else if(name=="TITLE_ID"&&text)info.id=text;else if(name=="TITLE")info.title=text}
+ return info}catch(e){return null}}
 async function send(list,lanes=4){ if(busy)return; const code=$("code").value.trim(); if(!/^\d{6}$/.test(code)){$("status").textContent="Enter the 6-digit pairing code first.";return}
  if(!list.length){$("status").textContent="Choose something to send first.";return}
  const checked=await fetch("/check",{headers:{"X-Pair-Code":code}}).catch(()=>null);if(!checked||checked.status!=204){$("status").textContent=checked?"Wrong pairing code.":"Can't reach the Xbox. Is XStation open on the Add Game page?";return}
+ for(const x of list){if(!x.path.startsWith("Import/"))continue;$("status").textContent="Checking "+x.file.name+"\u2026";const i=await pkgInfo(x.file);if(!i||!i.cat)continue;
+  const r=await fetch("/pkgcheck?id="+encodeURIComponent(i.id)+"&cat="+encodeURIComponent(i.cat),{headers:{"X-Pair-Code":code}}).catch(()=>null);
+  if(r&&r.status==409){$("status").textContent=(i.title?i.title+": ":"")+await r.text();return}}
  busy=true;$("sendDir").disabled=$("sendPkg").disabled=true;const total=list.reduce((a,x)=>a+x.file.size,0);let done=0,next=0,fail=null,count=0;const live=new Map();
  const paint=(n)=>{const now=done+[...live.values()].reduce((a,b)=>a+b,0);$("bar").value=total?now/total:1;$("status").textContent=fmt(now)+" of "+fmt(total)+" · "+count+" of "+list.length+" files · "+n};
  const one=x=>new Promise((res,rej)=>{const r=new XMLHttpRequest();r.open("PUT","/upload?path="+encodeURIComponent(x.path));r.setRequestHeader("X-Pair-Code",code);
-  r.upload.onprogress=e=>{live.set(x.path,e.loaded);paint(x.path)};r.onload=()=>{live.delete(x.path);r.status<300?res():rej(new Error(r.status==403?"Wrong pairing code.":r.status==507?"The Xbox is out of space.":r.status==409&&r.responseText?r.responseText:"Upload failed ("+r.status+"): "+x.path))};r.onerror=()=>{live.delete(x.path);rej(new Error("Connection lost at "+x.path))};r.send(x.file)});
+  r.upload.onprogress=e=>{live.set(x.path,e.loaded);paint(x.path)};r.onload=()=>{live.delete(x.path);r.status<300?res():rej(new Error(r.status==403?"Wrong pairing code.":r.status==507?"The Xbox is out of space.":r.status==409&&r.responseText?r.responseText:"Upload failed ("+r.status+"): "+x.path))};r.onerror=async()=>{live.delete(x.path);let m="";if(x.path.startsWith("Import/")){const q=await fetch("/pkgresult",{headers:{"X-Pair-Code":code}}).catch(()=>null);if(q&&q.status==409)m=await q.text()}rej(new Error(m||"Connection lost at "+x.path))};r.send(x.file)});
  const worker=async()=>{while(!fail&&next<list.length){const x=list[next++];try{await one(x);done+=x.file.size;count++;paint(x.path)}catch(e){fail=e}}};
  await Promise.all(Array.from({length:lanes},worker));
  $("status").textContent=fail?fail.message:"Done: "+count+" files, "+fmt(total)+". Restart XStation to see new games.";busy=false;$("sendDir").disabled=$("sendPkg").disabled=false}
@@ -161,6 +178,10 @@ void UploadPkg(SOCKET s, const std::wstring& relative, uint64_t length, const ch
         streamStatus.target.clear();
         streamStatus.update = false;
     }
+    {
+        std::lock_guard<std::mutex> lock(convertedLock);
+        lastPkgError.clear();
+    }
     streamStatus.stored = 0;
     streamStatus.progress.done = streamStatus.progress.total = 0;
     streamStatus.progress.files = streamStatus.progress.filesTotal = 0;
@@ -198,6 +219,7 @@ void UploadPkg(SOCKET s, const std::wstring& relative, uint64_t length, const ch
     {
         std::lock_guard<std::mutex> lock(convertedLock);
         lastPkgMessage = ok ? (phase == 3 ? L"Converted " + id + (update ? L" (update)" : L"") : error) : error;
+        if (!ok) lastPkgError = error.empty() ? (complete ? L"The PKG couldn't be converted." : L"The upload stopped before the end. Check the Wi-Fi and send it again.") : error;
     }
     if (ok && phase == 3) {
         {
@@ -209,6 +231,42 @@ void UploadPkg(SOCKET s, const std::wstring& relative, uint64_t length, const ch
     if (ok) { ++finished; Plain(s, "204 No Content"); return; }
     if (!complete && error.empty()) { Plain(s, "500 Internal Server Error"); return; }
     Message(s, "409 Conflict", error.empty() ? L"The PKG couldn't be converted." : error);
+}
+
+bool Paired(SOCKET s, const std::string& head) {
+    if (wrongCodes.load() >= 20) { Plain(s, "403 Forbidden"); return false; }
+    if (Header(head, "x-pair-code") != code) { ++wrongCodes; Plain(s, "403 Forbidden"); return false; }
+    return true;
+}
+
+std::string Query(const std::string& target, const char* name) {
+    const std::string key = std::string(name) + "=";
+    for (size_t at = target.find('?'); at != std::string::npos; at = target.find('&', at + 1))
+        if (target.compare(at + 1, key.size(), key) == 0) {
+            const size_t begin = at + 1 + key.size(), end = target.find('&', begin);
+            return Decode(target.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+        }
+    return {};
+}
+
+// 2026-11-14: GET /pkgcheck?id=CUSA00900&cat=gd, before a PKG is sent: the refusal PkgStream would give once the
+// PKG starts arriving (409 + reason), else 204.
+void PkgCheck(SOCKET s, const std::string& head, const std::string& target) {
+    if (!Paired(s, head)) return;
+    const std::string id = Query(target, "id"), cat = Query(target, "cat");
+    bool safe = id.size() == 9;
+    for (const char c : id) safe = safe && isalnum((unsigned char)c);
+    if (streaming) { Message(s, "409 Conflict", L"Another PKG is being converted. Send PKGs one at a time."); return; }
+    if (safe && cat == "gd") {
+        const std::wstring wid(id.begin(), id.end()), folder = root + L"\\Games\\" + wid;
+        const bool data = GetFileAttributesW((folder + L"\\" + GamePrepareDataFolder(wid)).c_str()) != INVALID_FILE_ATTRIBUTES;
+        const bool resuming = GetFileAttributesW((folder + L"\\.xstation-converting").c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (data && !resuming) {
+            Message(s, "409 Conflict", L"This game is already in your library. To send it again, delete it in XStation first (your saves are kept).");
+            return;
+        }
+    }
+    Plain(s, "204 No Content");
 }
 
 void Upload(SOCKET s, const std::string& head, const std::string& target, const char* extra, size_t extraSize) {
@@ -285,6 +343,14 @@ void Connection(SOCKET s) {
         if (wrongCodes.load() >= 20) Plain(s, "403 Forbidden");
         else if (Header(head, "x-pair-code") == code) Plain(s, "204 No Content");
         else { ++wrongCodes; Plain(s, "403 Forbidden"); }
+    }
+    else if (method == "GET" && target.rfind("/pkgcheck?", 0) == 0) PkgCheck(s, head, target);
+    else if (method == "GET" && target == "/pkgresult") {
+        if (Paired(s, head)) {
+            std::wstring why;
+            { std::lock_guard<std::mutex> lock(convertedLock); why = lastPkgError; }
+            if (why.empty() || streaming) Plain(s, "204 No Content"); else Message(s, "409 Conflict", why);
+        }
     }
     else if (method == "PUT" && target.rfind("/upload", 0) == 0) Upload(s, head, target, data.data() + end + 4, data.size() - end - 4);
     else Plain(s, "404 Not Found");

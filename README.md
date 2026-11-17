@@ -6,6 +6,8 @@
 
 XStation provides a console dashboard, game details and settings, USB discovery, Wi-Fi transfer, and on-console import/preparation for supported PS4 game dumps supplied by the user.
 
+Version **0.1.3.8** adds startup update checks with release details, on-console texture/shader preparation for The Last of Us and Uncharted, and improvements to import and transfer handling. Download the MSIX from [Releases](https://github.com/BBCPrince/XStation-UWP/releases).
+
 [Game compatibility and FPS](docs/COMPATIBILITY.md) | [Build from source](docs/BUILD.md) | [Runtime build guide](docs/RUNTIMES.md) | [Source scope](SOURCE-SCOPE.md) | [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 ## Games and measured Xbox performance
@@ -34,6 +36,7 @@ The application is written in **C++20**, using C++/WinRT and Windows UWP APIs. T
 | [`source/dashboard.cpp`](source/dashboard.cpp) | Library screen, game details, settings, and controller navigation |
 | [`source/game_app.cpp`](source/game_app.cpp) | UWP window, input, game startup, and per-title host integration |
 | [`source/game_prepare.cpp`](source/game_prepare.cpp) | On-console preparation of supported game images |
+| [`source/tlou_assets.cpp`](source/tlou_assets.cpp) | Texture reduction and shader-pack preparation from the user's game files |
 | [`source/pkg_extract.cpp`](source/pkg_extract.cpp) | PKG extraction and import |
 | [`source/transfer.cpp`](source/transfer.cpp) | Local-network transfer receiver |
 | [`source/usb_files.cpp`](source/usb_files.cpp) | USB discovery and file access |

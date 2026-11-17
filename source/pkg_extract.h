@@ -50,9 +50,12 @@ struct PkgShrink {
     uint64_t need = 0;        // out: free space using the PKGs up needs (set when the normal way doesn't fit)
     uint64_t normalNeed = 0;  // out: free space the normal way needs (same)
 };
+// `rewriteUpdates` (2026-11-14): an update added to a game already converted into outDir (pkgs = game, update): every
+// file the update brings is written again even when one of the same size is there (the game's own version), the
+// game's files are kept. Not for a resumed using-up conversion (its PKGs are already cut).
 bool PkgExtractGame(const std::vector<std::wstring>& pkgs, const std::wstring& outDir, PkgProgress* progress,
                     const std::atomic<bool>* cancel, bool resume, std::wstring& error, uint64_t freeBytes = 0,
-                    PkgShrink* shrink = nullptr);
+                    PkgShrink* shrink = nullptr, bool rewriteUpdates = false);
 
 // Wi-Fi streaming check (PC tool): how much of the PKG must arrive before the files can be planned, and the peak space a
 // convert while receiving would need with the PKG kept as `chunk`-byte pieces.

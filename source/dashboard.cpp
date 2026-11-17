@@ -39,12 +39,17 @@
 #include "usb_files.h"
 #include "pkg_extract.h"
 #include "game_prepare.h"
+#include "tlou_assets.h"
 #include <fileapifromapp.h>
 #include <winrt/Windows.Networking.h>
 #include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Storage.Search.h>
 #include <winrt/Windows.System.Profile.h>
+#include <winrt/Windows.System.h>
+#include <winrt/Windows.Web.Http.h>
+#include <winrt/Windows.Web.Http.Headers.h>
+#include <winrt/Windows.Data.Json.h>
 #include <fileapifromapp.h>
 
 using namespace winrt;
@@ -94,7 +99,7 @@ struct Game {
     int fps = 60; // what the game page shows; Titles\<id>\frame-limit.txt holds 30, or 0 for 60 (the host reads it)
     bool fsr{}; // HasFsrChoice games: 60 = FSR frame generation (Titles\<id>\frame-gen.txt holds 1)
     bool upscale = false; // HasFsrUpscale games: off = plain 540p (default); on (fsr-upscale.txt holds 1) = 540p + FSR to 1080p
-    bool cpu = true; // the engine's FPS and CPU box: cpu-counter.txt holds 1 or 0; no file = on (every game, 2026-11-14)
+    bool cpu = false; // the engine's FPS and CPU box: cpu-counter.txt holds 1 or 0; no file = off (every game, 2026-11-15)
 };
 
 struct UsbItem {
@@ -125,6 +130,94 @@ struct PkgFile {
 };
 
 bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+// XStation (2026-11-15): save export / import. The FromApp calls work on the USB drive and in LocalState alike.
+bool IsFolderFromApp(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    return GetFileAttributesExFromAppW(path.c_str(), GetFileExInfoStandard, &a) && (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+// One file, read and written through CreateFileFromAppW (no SECURITY_ATTRIBUTES: the broker refuses inheritable handles).
+// CopyFileFromAppW failed for every save on the Xbox's USB drive (2026-11-15). On failure `error` names the step and code.
+bool CopyFileThroughApp(const std::wstring& from, const std::wstring& to, uint64_t& bytes, std::wstring& error) {
+    HANDLE in = CreateFileFromAppW(from.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (in == INVALID_HANDLE_VALUE) { error = L"open " + from + L" (error " + std::to_wstring(GetLastError()) + L")"; return false; }
+    HANDLE out = CreateFileFromAppW(to.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        error = L"create " + to + L" (error " + std::to_wstring(GetLastError()) + L")";
+        CloseHandle(in);
+        return false;
+    }
+    std::vector<char> buffer(1 << 20);
+    bool ok = true;
+    for (;;) {
+        DWORD got = 0, put = 0;
+        if (!ReadFile(in, buffer.data(), DWORD(buffer.size()), &got, nullptr)) { error = L"read " + from + L" (error " + std::to_wstring(GetLastError()) + L")"; ok = false; break; }
+        if (!got) break;
+        if (!WriteFile(out, buffer.data(), got, &put, nullptr) || put != got) { error = L"write " + to + L" (error " + std::to_wstring(GetLastError()) + L")"; ok = false; break; }
+        bytes += got;
+    }
+    if (ok && !FlushFileBuffers(out)) { error = L"flush " + to + L" (error " + std::to_wstring(GetLastError()) + L")"; ok = false; }
+    CloseHandle(out);
+    CloseHandle(in);
+    if (!ok) DeleteFileFromAppW(to.c_str());
+    return ok;
+}
+// Copies every file under `from` into `to` (made as needed). False on the first failure, with `error` set.
+bool CopyTreeFromApp(const std::wstring& from, const std::wstring& to, uint64_t& files, uint64_t& bytes, std::wstring& error) {
+    if (!CreateDirectoryFromAppW(to.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        error = L"make folder " + to + L" (error " + std::to_wstring(GetLastError()) + L")";
+        return false;
+    }
+    WIN32_FIND_DATAW f;
+    HANDLE h = FindFirstFileExFromAppW((from + L"\\*").c_str(), FindExInfoBasic, &f, FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND) return true;
+        error = L"list " + from + L" (error " + std::to_wstring(GetLastError()) + L")";
+        return false;
+    }
+    bool ok = true;
+    do {
+        const std::wstring name = f.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ok = CopyTreeFromApp(from + L"\\" + name, to + L"\\" + name, files, bytes, error);
+        } else {
+            ok = CopyFileThroughApp(from + L"\\" + name, to + L"\\" + name, bytes, error);
+            if (ok) ++files;
+        }
+    } while (ok && FindNextFileW(h, &f));
+    FindClose(h);
+    return ok;
+}
+// Removes a folder tree this code made (a failed import copy).
+void DeleteTreeFromApp(const std::wstring& path) {
+    WIN32_FIND_DATAW f;
+    HANDLE h = FindFirstFileExFromAppW((path + L"\\*").c_str(), FindExInfoBasic, &f, FindExSearchNameMatch, nullptr, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name = f.cFileName;
+            if (name == L"." || name == L"..") continue;
+            if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) DeleteTreeFromApp(path + L"\\" + name);
+            else DeleteFileFromAppW((path + L"\\" + name).c_str());
+        } while (FindNextFileW(h, &f));
+        FindClose(h);
+    }
+    RemoveDirectoryFromAppW(path.c_str());
+}
+// A game's save folder: Bloodborne's engine keeps saves in game-user, the others in tlou-bb194-user.
+std::wstring SaveFolder(const std::wstring& local, const std::wstring& id) {
+    const std::wstring title = local + L"\\Titles\\" + id;
+    for (const wchar_t* user : {L"game-user", L"tlou-bb194-user"})
+        if (IsFolderFromApp(title + L"\\" + user + L"\\savedata")) return title + L"\\" + user + L"\\savedata";
+    return title + (id == L"CUSA00900" ? L"\\game-user\\savedata" : L"\\tlou-bb194-user\\savedata");
+}
+std::wstring SaveStamp() {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t s[40];
+    swprintf(s, 40, L"%04u-%02u-%02u %02u-%02u-%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return s;
+}
 
 std::wstring FromUtf8(const std::string& text) {
     if (text.empty()) return {};
@@ -222,7 +315,7 @@ void ScanGames(const std::wstring& root, const std::wstring& package, const std:
         {
             std::ifstream counter(local + L"\\Titles\\" + id + L"\\cpu-counter.txt");
             int value = 0;
-            g.cpu = counter >> value ? value != 0 : true; // 2026-11-14 (user): on for every game unless turned off
+            g.cpu = counter >> value ? value != 0 : false; // 2026-11-15 (user): off for every game unless turned on
         }
         if (HasFsrChoice(id)) {
             std::ifstream frameGen(local + L"\\Titles\\" + id + L"\\frame-gen.txt");
@@ -314,7 +407,16 @@ struct DashApp : ApplicationT<DashApp> {
     std::wstring local, package, dataRoot;
     bool confirmOpen = false, gamesDriveMissing = false;
     int confirmKind = 0; // what the open question is about: 0 deleting the game, 1 turning FSR on, 2 deleting converted PKGs,
-                         // 3 using a PKG up to convert it (no room for the PKG and the game together)
+                         // 3 using a PKG up to convert it (no room for the PKG and the game together), 4 importing saves,
+                         // 5 a newer XStation on GitHub (A opens its page)
+    // XStation 2026-11-17: the newest release of the public repo, when it is newer than this package (CheckForUpdate)
+    std::wstring updateTag, updateMine, updateNotes, updateUrl;
+    std::atomic<bool> updateReady{false};
+    bool updateTestDev = false;
+    bool savesBusy = false;               // a save export or import is running
+    std::vector<std::wstring> importChoices; // exports of the selected game on the USB drive, newest first
+    size_t importPick = 0;
+    std::wstring importRoot;              // that USB drive
     TextBlock storage{nullptr};
     int storageWait = 0;
     std::atomic<bool> deleting{false}, deleteFinished{false};
@@ -409,6 +511,11 @@ struct DashApp : ApplicationT<DashApp> {
     TextBlock cardTime{nullptr}, cardTimeSub{nullptr}, cardSpeed{nullptr}, cardSpeedSub{nullptr}, cardSize{nullptr}, cardSizeSub{nullptr},
         cardStatus{nullptr}, cardStatusSub{nullptr}, playLabel{nullptr}, detailsText{nullptr}, fpsLabel{nullptr};
     Border playButton{nullptr}, details{nullptr}, fpsButton{nullptr}, upscaleButton{nullptr};
+    // XStation (2026-11-15): the Details view (confirm questions still use detailsText).
+    StackPanel detailsView{nullptr};
+    TextBlock dTitle{nullptr}, dSub{nullptr}, dFolder{nullptr}, dSaves{nullptr}, dEngine{nullptr}, dBoot{nullptr}, dCpu{nullptr},
+        dStatus{nullptr};
+    Border dStatusBox{nullptr};
     FrameworkElement hintFps{nullptr}, hintUpscale{nullptr};
     TextBlock upscaleLabel{nullptr};
     Polygon playIcon{nullptr};
@@ -493,6 +600,141 @@ struct DashApp : ApplicationT<DashApp> {
         text.VerticalAlignment(VerticalAlignment::Center);
         row.Children().Append(text);
         return row;
+    }
+
+    // A controller button as a small rounded label (wider than Hint's dot, so "VIEW" and "☰" fit).
+    Border ButtonChip(const std::wstring& label, Color color) {
+        Border b;
+        b.Background(SolidColorBrush(color));
+        b.CornerRadius(CornerRadius{10, 10, 10, 10});
+        b.MinWidth(20);
+        b.Height(20);
+        b.Padding(Thickness{6, 0, 6, 0});
+        b.VerticalAlignment(VerticalAlignment::Center);
+        auto t = Text(label, 10);
+        t.FontWeight(Windows::UI::Text::FontWeights::Bold());
+        t.HorizontalAlignment(HorizontalAlignment::Center);
+        t.VerticalAlignment(VerticalAlignment::Center);
+        b.Child(t);
+        return b;
+    }
+    Border Divider() {
+        Border line;
+        line.Height(1);
+        line.Background(White(34));
+        return line;
+    }
+    // One "label  value" line of the info grid.
+    TextBlock InfoRow(Grid& grid, const std::wstring& label) {
+        const int row = grid.RowDefinitions().Size();
+        grid.RowDefinitions().Append(RowDefinition());
+        auto name = Text(label, 12, White(140));
+        name.Margin(Thickness{0, 3, 16, 3});
+        Grid::SetRow(name, row);
+        grid.Children().Append(name);
+        auto value = Text(L"", 13, White(230));
+        value.TextWrapping(TextWrapping::Wrap);
+        value.TextTrimming(TextTrimming::None);
+        value.Margin(Thickness{0, 3, 0, 3});
+        Grid::SetRow(value, row);
+        Grid::SetColumn(value, 1);
+        grid.Children().Append(value);
+        return value;
+    }
+    // One option: button chip, what it does, and (for the CPU counter) its state on the right.
+    void OptionRow(StackPanel& list, Border chip, const std::wstring& label, TextBlock* state) {
+        Grid row;
+        ColumnDefinition a, b, s;
+        a.Width(GridLengthHelper::FromValueAndType(64, GridUnitType::Pixel));
+        b.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+        s.Width(GridLengthHelper::Auto());
+        row.ColumnDefinitions().Append(a);
+        row.ColumnDefinitions().Append(b);
+        row.ColumnDefinitions().Append(s);
+        row.Padding(Thickness{12, 9, 14, 9});
+        row.Background(White(14));
+        row.CornerRadius(CornerRadius{6, 6, 6, 6});
+        chip.HorizontalAlignment(HorizontalAlignment::Left);
+        row.Children().Append(chip);
+        auto text = Text(label, 13, White(235));
+        text.VerticalAlignment(VerticalAlignment::Center);
+        Grid::SetColumn(text, 1);
+        row.Children().Append(text);
+        if (state) {
+            *state = Text(L"", 13);
+            state->FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+            state->VerticalAlignment(VerticalAlignment::Center);
+            Grid::SetColumn(*state, 2);
+            row.Children().Append(*state);
+        }
+        list.Children().Append(row);
+    }
+    StackPanel BuildDetailsView() {
+        detailsView = StackPanel();
+        detailsView.Spacing(14);
+        detailsView.Visibility(Visibility::Collapsed);
+        dTitle = Text(L"", 24);
+        dTitle.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+        dSub = Text(L"", 13, White(160));
+        StackPanel head;
+        head.Spacing(2);
+        head.Children().Append(dTitle);
+        head.Children().Append(dSub);
+        detailsView.Children().Append(head);
+        detailsView.Children().Append(Divider());
+        Grid info;
+        ColumnDefinition l, v;
+        l.Width(GridLengthHelper::Auto());
+        v.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+        info.ColumnDefinitions().Append(l);
+        info.ColumnDefinitions().Append(v);
+        dFolder = InfoRow(info, L"Game folder");
+        dSaves = InfoRow(info, L"Saves");
+        dEngine = InfoRow(info, L"Engine");
+        dBoot = InfoRow(info, L"Prepared image");
+        detailsView.Children().Append(info);
+        auto heading = Text(L"OPTIONS", 11, White(130));
+        heading.CharacterSpacing(120);
+        heading.Margin(Thickness{0, 4, 0, 0});
+        detailsView.Children().Append(heading);
+        StackPanel options;
+        options.Spacing(6);
+        OptionRow(options, ButtonChip(L"☰", Color{255, 70, 78, 92}), L"CPU counter (FPS and CPU use, top right)", &dCpu);
+        OptionRow(options, ButtonChip(L"VIEW", Color{255, 70, 78, 92}), L"Export saves to the USB drive", nullptr);
+        OptionRow(options, ButtonChip(L"X", Color{255, 40, 90, 170}), L"Import saves from the USB drive", nullptr);
+        detailsView.Children().Append(options);
+        dStatusBox = Border();
+        dStatusBox.CornerRadius(CornerRadius{6, 6, 6, 6});
+        dStatusBox.Padding(Thickness{12, 8, 12, 8});
+        dStatusBox.Visibility(Visibility::Collapsed);
+        dStatus = Text(L"", 12);
+        dStatus.TextWrapping(TextWrapping::Wrap);
+        dStatus.TextTrimming(TextTrimming::None);
+        dStatusBox.Child(dStatus);
+        detailsView.Children().Append(dStatusBox);
+        detailsView.Children().Append(Divider());
+        Grid foot;
+        ColumnDefinition f1, f2;
+        f1.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+        f2.Width(GridLengthHelper::Auto());
+        foot.ColumnDefinitions().Append(f1);
+        foot.ColumnDefinitions().Append(f2);
+        auto tip = Text(L"While playing, hold View + Menu for 3 seconds to come back here.", 11, White(140));
+        tip.VerticalAlignment(VerticalAlignment::Center);
+        foot.Children().Append(tip);
+        auto close = Hint(L"B", L"CLOSE", Color{255, 170, 44, 44});
+        Grid::SetColumn(close, 1);
+        foot.Children().Append(close);
+        detailsView.Children().Append(foot);
+        return detailsView;
+    }
+    // The result of a save export or import: in the Details panel (green or red) and in the bottom line.
+    void SaveStatus(const std::wstring& text, bool ok) {
+        notice.Text(text);
+        if (!dStatus) return;
+        dStatus.Text(text);
+        dStatusBox.Background(ok ? Solid(60, 40, 160, 80) : Solid(70, 200, 50, 50));
+        dStatusBox.Visibility(text.empty() ? Visibility::Collapsed : Visibility::Visible);
     }
 
     Border Card(const std::wstring& heading, TextBlock& big, TextBlock& sub, double width) {
@@ -856,7 +1098,12 @@ struct DashApp : ApplicationT<DashApp> {
         detailsText = Text(L"", 14);
         detailsText.TextWrapping(TextWrapping::Wrap);
         detailsText.TextTrimming(TextTrimming::None);
-        details.Child(detailsText);
+        {
+            Grid both;
+            both.Children().Append(detailsText);
+            both.Children().Append(BuildDetailsView());
+            details.Child(both);
+        }
         canvas.Children().Append(details);
 
         toast = Border();
@@ -1145,7 +1392,21 @@ struct DashApp : ApplicationT<DashApp> {
         gamesPage.Visibility(tab == 0 ? Visibility::Visible : Visibility::Collapsed);
         addPage.Visibility(tab == 1 ? Visibility::Visible : Visibility::Collapsed);
         details.Visibility(detailsOpen || confirmOpen ? Visibility::Visible : Visibility::Collapsed);
-        if (confirmOpen && confirmKind == 3) {
+        detailsText.Visibility(confirmOpen ? Visibility::Visible : Visibility::Collapsed);
+        if (detailsView) detailsView.Visibility(detailsOpen && !confirmOpen ? Visibility::Visible : Visibility::Collapsed);
+        if (confirmOpen && confirmKind == 5) {
+            detailsText.Text(L"XStation " + updateTag + L" is out. You have " + updateMine + L".\n\nWhat's new:\n" + updateNotes +
+                             L"\n\nTo update, download the .msix from the release page and install it with Xbox Device Portal "
+                             L"(Apps, Add), like before. Your games and saves stay.\n" + updateUrl +
+                             L"\n\nA  Open the page          B  Later");
+        } else if (confirmOpen && confirmKind == 4 && selected < games.size() && importPick < importChoices.size()) {
+            detailsText.Text(L"Import saves for " + games[selected].title + L"?\n\nFrom the USB drive:  XStation\\Saves\\" + games[selected].id +
+                             L"\\" + importChoices[importPick] + L"\n(" + std::to_wstring(importPick + 1) + L" of " +
+                             std::to_wstring(importChoices.size()) + L", newest first" +
+                             (importChoices.size() > 1 ? L"; press X for the next one)" : L")") +
+                             L"\n\nThe game's current saves are replaced. They are kept first on the Xbox in Titles\\" + games[selected].id +
+                             L"\\save-backups, so nothing is lost.\n\nA  Import          B  Cancel");
+        } else if (confirmOpen && confirmKind == 3) {
             const std::wstring name = shrinkOfferPath.substr(shrinkOfferPath.find_last_of(L'\\') + 1);
             detailsText.Text(L"Use up the PKG to convert it?\n\n" + name +
                              L"\n\nThe drive doesn't have room for the PKG and the game together: the normal way needs " + FormatBytes(shrinkOfferNormal) +
@@ -1262,13 +1523,18 @@ struct DashApp : ApplicationT<DashApp> {
         SetCards(FormatHours(g.seconds), FormatAgo(g.lastPlayed), speed, speed == L"Not tested" ? L"No results recorded" : L"Tested on Xbox Series X", status, statusSub,
                  FormatBytes(g.bytes), g.id + (g.version.empty() ? L"" : L"  ·  v" + g.version));
         if (heroChanged) ShowHero(g);
-        if (detailsOpen) {
-            detailsText.Text(g.title + L"\n\nTitle ID:  " + g.id + L"\nVersion:  " + (g.version.empty() ? L"—" : g.version) +
-                             L"\nGame folder:  " + g.folder + L"\nSaves:  " + local + L"\\Titles\\" + g.id +
-                             L"\nEngine:  " + (g.hasEngine ? L"Included" : L"Not included") +
-                             L"\nPrepared image:  " + (g.hasBoot ? L"Found" : L"Missing") +
-                             L"\nCPU counter:  " + (g.cpu ? L"On" : L"Off") + L"   (press \u2630 Menu to change)" +
-                             L"\n\nWhile playing, hold View + Menu for 3 seconds to return here.\n\nPress B to close.");
+        if (detailsOpen && detailsView) {
+            dTitle.Text(g.title);
+            dSub.Text(g.id + (g.version.empty() ? L"" : L"   \u00B7   Version " + g.version) + L"   \u00B7   " + FormatBytes(g.bytes) +
+                      (g.mounted ? L"   \u00B7   On a USB drive" : L""));
+            dFolder.Text(g.folder);
+            dSaves.Text(SaveFolder(local, g.id));
+            dEngine.Text(g.hasEngine ? L"Included" : L"Not included");
+            dEngine.Foreground(g.hasEngine ? White(230) : Solid(255, 240, 120, 110));
+            dBoot.Text(g.hasBoot ? L"Found" : L"Missing");
+            dBoot.Foreground(g.hasBoot ? White(230) : Solid(255, 240, 120, 110));
+            dCpu.Text(g.cpu ? L"On" : L"Off");
+            dCpu.Foreground(g.cpu ? Solid(255, 110, 220, 140) : White(150));
         }
     }
 
@@ -1296,10 +1562,12 @@ struct DashApp : ApplicationT<DashApp> {
             wifiStatusText.Text(L"The transfer couldn't start on this network.");
             return;
         }
+#ifndef XSTATION_PUBLIC
         if (Exists(dataRoot + L"\\dev-open-add-page.txt")) {
             std::ofstream dev(dataRoot + L"\\dev-pairing.txt", std::ios::trunc);
             dev << pairing;
         }
+#endif
         std::wstring address;
         try {
             for (auto const& host : Windows::Networking::Connectivity::NetworkInformation::GetHostNames()) {
@@ -1954,7 +2222,10 @@ struct DashApp : ApplicationT<DashApp> {
         // Bloodborne's engine uses its 1.09 folder names (GameData109).
         const std::wstring target = root + L"\\XStation\\" + item.id, data = target + L"\\" + GamePrepareDataFolder(item.id),
                            marker = target + L"\\.xstation-converting";
-        if (Exists(data) && !Exists(marker)) {
+        // 2026-11-14: an update for a game already converted on the drive goes on top of it (only the update's files are
+        // written), so a game converted without its update doesn't have to be converted again.
+        const bool addUpdate = item.category == "gp";
+        if (Exists(data) && !Exists(marker) && !addUpdate) {
             usbStatus = L"XStation\\" + item.id + L" is already on the drive. Mount or copy it, or delete that folder to convert again.";
             RefreshUsb();
             return;
@@ -2001,7 +2272,7 @@ struct DashApp : ApplicationT<DashApp> {
             const auto began = std::chrono::steady_clock::now();
             PkgShrink shrink;
             shrink.allowed = useUp;
-            const bool converted = PkgExtractGame(pkgs, data, &convertProgress, nullptr, true, err, freeBytes, &shrink);
+            const bool converted = PkgExtractGame(pkgs, data, &convertProgress, nullptr, true, err, freeBytes, &shrink, pkgs.size() > 1);
             if (shrink.need)
                 UsbLog(L"use-up: allowed " + std::to_wstring(useUp) + L" used " + std::to_wstring(shrink.used) + L" need " + std::to_wstring(shrink.need) +
                        L" normal need " + std::to_wstring(shrink.normalNeed) + L" free " + std::to_wstring(freeBytes));
@@ -2332,12 +2603,40 @@ struct DashApp : ApplicationT<DashApp> {
             notice.Text(g.hasEngine ? L"This game isn't prepared yet. Run the PC import tool." : L"XStation has no engine for this game yet.");
             return;
         }
+        // 2026-11-14: The Last of Us needs its reduced home textures and shader packs (made at prepare time); a game
+        // prepared before that, or whose files were replaced, gets them here once, then starts.
+        // Uncharted likewise: its 25 texture dictionaries trimmed (several minutes, once).
+        const bool tlouAssets = g.id == L"CUSA00552" && TlouAssetsNeeded(g.folder);
+        const bool ucAssets = g.id == L"CUSA02343" && UnchartedAssetsNeeded(g.folder);
+        if (tlouAssets || ucAssets) {
+            launching = true;
+            notice.Text(tlouAssets ? L"Getting The Last of Us ready: smaller home textures and shader packs from your game files. This takes a few minutes, once."
+                                   : L"Getting Uncharted ready: smaller texture files from your game files. This takes several minutes, once.");
+            const auto dispatcher = Window::Current().Dispatcher();
+            std::thread([this, keep = get_strong(), dispatcher, tlouAssets, id = g.id, title = g.title, folder = g.folder] {
+                std::string detail;
+                const auto began = std::chrono::steady_clock::now();
+                if (tlouAssets) TlouPrepareAssets(folder, detail);
+                else UnchartedTrimTextures(folder, detail);
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+                UsbLog(L"game assets " + folder + L" in " + std::to_wstring((int)s) + L" s\n" + FromUtf8(detail));
+                dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [this, keep, id, title] {
+                    launching = false;
+                    StartGame(id, title);
+                });
+            }).detach();
+            return;
+        }
+        StartGame(g.id, g.title);
+    }
+
+    void StartGame(const std::wstring& id, const std::wstring& title) {
         {
             std::wofstream request(local + L"\\play.txt", std::ios::trunc);
-            request << g.id;
+            request << id;
         }
         launching = true;
-        notice.Text(L"Starting " + g.title + L"…");
+        notice.Text(L"Starting " + title + L"…");
         auto operation = Windows::ApplicationModel::Core::CoreApplication::RequestRestartAsync(L"");
         operation.Completed([this](auto const& op, auto) {
             const auto result = op.GetResults();
@@ -2443,6 +2742,267 @@ struct DashApp : ApplicationT<DashApp> {
                        : g.title + L" won't show the CPU counter. XStation's memory and FPS line stays.");
     }
 
+    // XStation (2026-11-15): View in Details copies the game's saves to <USB>\XStation\Saves\<id>\<date time>.
+    fire_and_forget ExportSaves() {
+        if (tab != 0 || !detailsOpen || confirmOpen || deleting || launching || savesBusy || games.empty()) co_return;
+        auto keep = get_strong();
+        const Game g = games[selected];
+        const std::wstring from = SaveFolder(local, g.id);
+        if (!IsFolderFromApp(from)) { notice.Text(g.title + L" has no saves yet."); co_return; }
+        savesBusy = true;
+        notice.Text(L"Exporting " + g.title + L" saves to the USB drive…");
+        std::wstring root;
+        try {
+            auto drives = co_await KnownFolders::RemovableDevices().GetFoldersAsync();
+            for (auto const& drive : drives) { root = drive.Path().c_str(); break; }
+        } catch (...) {}
+        while (!root.empty() && root.back() == L'\\') root.pop_back();
+        if (root.empty()) { savesBusy = false; notice.Text(L"No USB drive found. Plug one in and try again."); co_return; }
+        const auto dispatcher = Window::Current().Dispatcher();
+        std::thread([this, keep, dispatcher, g, from, root] {
+            const std::wstring game = root + L"\\XStation\\Saves\\" + g.id, stamp = SaveStamp(), to = game + L"\\" + stamp;
+            CreateDirectoryFromAppW((root + L"\\XStation").c_str(), nullptr);
+            CreateDirectoryFromAppW((root + L"\\XStation\\Saves").c_str(), nullptr);
+            CreateDirectoryFromAppW(game.c_str(), nullptr);
+            uint64_t files = 0, bytes = 0;
+            std::wstring error;
+            bool ok = CreateDirectoryFromAppW(to.c_str(), nullptr) != 0;
+            if (!ok) error = L"make folder " + to + L" (error " + std::to_wstring(GetLastError()) + L")";
+            if (ok) ok = CopyTreeFromApp(from, to + L"\\savedata", files, bytes, error);
+            if (ok) {
+                std::ofstream info(to + L"\\info.txt", std::ios::trunc | std::ios::binary);
+                info << ToUtf8(g.title) << "\r\n" << ToUtf8(g.id) << "\r\n" << files << " files, " << bytes << " bytes\r\n"
+                     << "from " << ToUtf8(from.substr(local.size())) << "\r\n";
+                ok = bool(info.flush());
+                if (!ok) error = L"write info.txt";
+            }
+            // 2026-11-15: a failed export leaves nothing behind (0.1.2.2 left an empty date folder per try).
+            if (!ok) { DeleteTreeFromApp(to); RemoveDirectoryFromAppW(game.c_str()); }
+            UsbLog(L"save export " + g.id + L" -> " + to + (ok ? L" ok " : L" FAILED ") + std::to_wstring(files) + L" files" +
+                   (error.empty() ? L"" : L": " + error));
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [this, keep, g, stamp, files, bytes, ok, error] {
+                savesBusy = false;
+                SaveStatus(ok ? L"Exported " + std::to_wstring(files) + L" save files (" + FormatBytes(bytes) + L") to the USB drive: XStation\\Saves\\" +
+                                    g.id + L"\\" + stamp
+                              : L"Couldn't export the saves to the USB drive: " + error + L". Your saves on the Xbox weren't changed.", ok);
+            });
+        }).detach();
+    }
+
+    // X in Details: find this game's exports on the USB drive and ask which one to import (X again: the next older).
+    fire_and_forget AskImport() {
+        if (tab != 0 || !detailsOpen || confirmOpen || deleting || launching || savesBusy || games.empty()) co_return;
+        auto keep = get_strong();
+        const Game g = games[selected];
+        savesBusy = true;
+        notice.Text(L"Looking for saved exports on the USB drive…");
+        std::wstring root;
+        try {
+            auto drives = co_await KnownFolders::RemovableDevices().GetFoldersAsync();
+            for (auto const& drive : drives) { root = drive.Path().c_str(); break; }
+        } catch (...) {}
+        while (!root.empty() && root.back() == L'\\') root.pop_back();
+        savesBusy = false;
+        if (root.empty()) { notice.Text(L"No USB drive found. Plug in the drive with the exported saves and try again."); co_return; }
+        std::vector<std::wstring> found;
+        const std::wstring game = root + L"\\XStation\\Saves\\" + g.id;
+        WIN32_FIND_DATAW f;
+        HANDLE h = FindFirstFileExFromAppW((game + L"\\*").c_str(), FindExInfoBasic, &f, FindExSearchNameMatch, nullptr, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                const std::wstring name = f.cFileName;
+                if (name != L"." && name != L".." && (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && IsFolderFromApp(game + L"\\" + name + L"\\savedata"))
+                    found.push_back(name);
+            } while (FindNextFileW(h, &f));
+            FindClose(h);
+        }
+        if (found.empty()) { notice.Text(L"No exported saves for " + g.title + L" on the USB drive (looked in XStation\\Saves\\" + g.id + L")."); co_return; }
+        std::sort(found.begin(), found.end(), std::greater<>()); // the names are dates: newest first
+        if (!detailsOpen || confirmOpen || selected >= games.size() || games[selected].id != g.id) co_return;
+        importChoices = found;
+        importPick = 0;
+        importRoot = root;
+        confirmKind = 4;
+        confirmOpen = true;
+        notice.Text(L"");
+        Refresh(false);
+    }
+
+    void NextImport() {
+        if (!confirmOpen || confirmKind != 4 || importChoices.size() < 2) return;
+        importPick = (importPick + 1) % importChoices.size();
+        Refresh(false);
+    }
+
+    void ConfirmImport() {
+        if (!confirmOpen || confirmKind != 4 || selected >= games.size() || importPick >= importChoices.size()) return;
+        confirmOpen = false;
+        confirmKind = 0;
+        const Game g = games[selected];
+        const std::wstring from = importRoot + L"\\XStation\\Saves\\" + g.id + L"\\" + importChoices[importPick] + L"\\savedata",
+                           choice = importChoices[importPick];
+        savesBusy = true;
+        notice.Text(L"Importing " + g.title + L" saves from the USB drive…");
+        Refresh(false);
+        const auto dispatcher = Window::Current().Dispatcher();
+        std::thread([this, keep = get_strong(), dispatcher, g, from, choice] {
+            const std::wstring to = SaveFolder(local, g.id), title = local + L"\\Titles\\" + g.id;
+            const std::wstring backups = title + L"\\save-backups", backup = backups + L"\\" + SaveStamp();
+            std::wstring error;
+            bool moved = false;
+            uint64_t files = 0, bytes = 0;
+            CreateDirectoryFromAppW((local + L"\\Titles").c_str(), nullptr);
+            CreateDirectoryFromAppW(title.c_str(), nullptr);
+            CreateDirectoryFromAppW(to.substr(0, to.find_last_of(L'\\')).c_str(), nullptr); // the engine's user folder
+            if (!IsFolderFromApp(from)) error = L"The export isn't on the USB drive any more.";
+            if (error.empty() && IsFolderFromApp(to)) {
+                CreateDirectoryFromAppW(backups.c_str(), nullptr);
+                CreateDirectoryFromAppW(backup.c_str(), nullptr);
+                if (MoveFileFromAppW(to.c_str(), (backup + L"\\savedata").c_str())) moved = true;
+                else error = L"Couldn't set the current saves aside, so nothing was changed.";
+            }
+            std::wstring step;
+            if (error.empty() && !CopyTreeFromApp(from, to, files, bytes, step)) {
+                DeleteTreeFromApp(to); // only the partial copy just made
+                if (moved && MoveFileFromAppW((backup + L"\\savedata").c_str(), to.c_str())) moved = false;
+                error = L"The copy failed (" + step + L"). " + (moved ? L"Your previous saves are in Titles\\" + g.id + L"\\save-backups."
+                                                                      : L"Your previous saves were put back.");
+            }
+            UsbLog(L"save import " + g.id + L" <- " + from + (error.empty() ? L" ok " : L" FAILED ") + std::to_wstring(files) + L" files" +
+                   (moved ? L", previous in " + backup : L""));
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [this, keep, g, choice, files, moved, error] {
+                savesBusy = false;
+                SaveStatus(!error.empty() ? error
+                                          : L"Imported " + std::to_wstring(files) + L" save files for " + g.title + L" from " + choice + L"." +
+                                                (moved ? L" The previous saves are kept in Titles\\" + g.id + L"\\save-backups." : L""),
+                           error.empty());
+                Refresh(false);
+            });
+        }).detach();
+    }
+
+    // Check the newest release of the public
+    // repo BBCPrince/XStation-UWP. Its tag v<major>.<minor>.<build>.<revision> is compared with this package; when
+    // newer, its notes are shown once a day until the user opens the page. Any failure (offline, no release) shows nothing.
+    static bool ParseVersion(const std::wstring& text, uint64_t& out) {
+        size_t at = 0;
+        while (at < text.size() && !iswdigit(text[at])) ++at;
+        uint64_t parts[4] = {};
+        int n = 0;
+        for (; n < 4 && at < text.size() && iswdigit(text[at]); ++n) {
+            uint64_t v = 0;
+            while (at < text.size() && iswdigit(text[at])) v = v * 10 + (text[at++] - L'0');
+            parts[n] = v > 0xffff ? 0xffff : v;
+            if (at < text.size() && text[at] == L'.') ++at; else { ++n; break; }
+        }
+        if (n < 2) return false;
+        out = (parts[0] << 48) | (parts[1] << 32) | (parts[2] << 16) | parts[3];
+        return true;
+    }
+
+    static std::wstring NotesText(std::wstring s) {
+        std::wstring out;
+        size_t lines = 0;
+        size_t at = 0;
+        while (at <= s.size() && lines < 18) {
+            size_t end = s.find(L'\n', at);
+            if (end == std::wstring::npos) end = s.size();
+            std::wstring line = s.substr(at, end - at);
+            at = end + 1;
+            while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
+            size_t lead = 0;
+            while (lead < line.size() && (line[lead] == L'#' || line[lead] == L' ')) ++lead;
+            line = line.substr(lead);
+            for (size_t k; (k = line.find(L"**")) != std::wstring::npos;) line.erase(k, 2);
+            for (size_t k; (k = line.find(L"](")) != std::wstring::npos;) { // [text](link) -> text
+                const size_t open = line.rfind(L'[', k), close = line.find(L')', k);
+                if (open == std::wstring::npos || close == std::wstring::npos) break;
+                line = line.substr(0, open) + line.substr(open + 1, k - open - 1) + line.substr(close + 1);
+            }
+            if (line.size() > 1 && (line[0] == L'-' || line[0] == L'*') && line[1] == L' ') line = L"\u2022 " + line.substr(2);
+            if (line.empty() && (out.empty() || out.back() == L'\n')) continue;
+            out += line + L"\n";
+            ++lines;
+        }
+        while (!out.empty() && out.back() == L'\n') out.pop_back();
+        if (at < s.size()) out += L"\n\u2026 (more on the release page)";
+        if (out.size() > 1400) out = out.substr(0, 1400) + L"\u2026";
+        return out.empty() ? L"(no notes)" : out;
+    }
+
+    static std::wstring Today() {
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        wchar_t text[16];
+        swprintf(text, 16, L"%04d%02d%02d", t.wYear, t.wMonth, t.wDay);
+        return text;
+    }
+
+    void UpdateSeen() { // asked today for this release: not again until tomorrow
+        std::wofstream seen(local + L"\\update-seen.txt", std::ios::trunc);
+        seen << updateTag << L"\n" << Today() << L"\n";
+    }
+
+    void OpenUpdate() {
+        if (!confirmOpen || confirmKind != 5) return;
+        UpdateSeen();
+        confirmOpen = false;
+        confirmKind = 0;
+        Refresh(false);
+        if (!updateUrl.empty()) Windows::System::Launcher::LaunchUriAsync(Uri(updateUrl));
+    }
+
+    fire_and_forget CheckForUpdate() {
+        auto keep = get_strong();
+        const auto v = Windows::ApplicationModel::Package::Current().Id().Version();
+        const uint64_t mine = updateTestDev ? 0 : (uint64_t(v.Major) << 48) | (uint64_t(v.Minor) << 32) | (uint64_t(v.Build) << 16) | v.Revision;
+        const std::wstring mineText = std::to_wstring(v.Major) + L"." + std::to_wstring(v.Minor) + L"." + std::to_wstring(v.Build) + L"." +
+                                      std::to_wstring(v.Revision);
+        std::wstring seenTag, seenDay;
+        { std::wifstream seen(local + L"\\update-seen.txt"); std::getline(seen, seenTag); std::getline(seen, seenDay); }
+        co_await resume_background();
+        try {
+            Windows::Web::Http::HttpClient http;
+            http.DefaultRequestHeaders().UserAgent().TryParseAdd(L"XStation-UWP");
+            http.DefaultRequestHeaders().Accept().TryParseAdd(L"application/vnd.github+json");
+            // The release list, not releases/latest: that one skips pre-releases, and the repo's releases are "Preview"
+            // pre-releases. The highest tag wins; drafts are not listed to others anyway.
+            const hstring body = co_await http.GetStringAsync(Uri(L"https://api.github.com/repos/BBCPrince/XStation-UWP/releases?per_page=20"));
+            const auto list = Windows::Data::Json::JsonArray::Parse(body);
+            Windows::Data::Json::JsonObject j{nullptr};
+            uint64_t theirs = 0;
+            auto field = [](Windows::Data::Json::JsonObject const& o, const wchar_t* key) -> std::wstring {
+                if (!o.HasKey(key)) return L"";
+                const auto value = o.GetNamedValue(key);
+                return value.ValueType() == Windows::Data::Json::JsonValueType::String ? std::wstring(value.GetString()) : L"";
+            };
+            for (const auto& item : list) {
+                if (item.ValueType() != Windows::Data::Json::JsonValueType::Object) continue;
+                const auto o = item.GetObject();
+                if (o.HasKey(L"draft") && o.GetNamedValue(L"draft").ValueType() == Windows::Data::Json::JsonValueType::Boolean && o.GetNamedBoolean(L"draft")) continue;
+                uint64_t version = 0;
+                if (ParseVersion(field(o, L"tag_name"), version) && version > theirs) { theirs = version; j = o; }
+            }
+            if (!j) co_return;
+            auto text = [&](const wchar_t* key) { return field(j, key); };
+            const std::wstring tag = text(L"tag_name"), url = text(L"html_url");
+            if (tag.empty() || url.rfind(L"https://github.com/", 0) != 0 || theirs <= mine) co_return;
+            std::wstring shown = tag;
+            if (!shown.empty() && (shown[0] == L'v' || shown[0] == L'V')) shown.erase(0, 1);
+            if (!updateTestDev && seenTag == shown && seenDay == Today()) co_return; // "later" today
+            const std::wstring name = text(L"name"), notes = NotesText(text(L"body"));
+            {
+                std::lock_guard<std::mutex> lock(copyLock);
+                updateTag = shown;
+                updateMine = mineText;
+                updateNotes = (name.empty() || name == tag ? L"" : name + L"\n") + notes;
+                updateUrl = url;
+            }
+            updateReady = true;
+        } catch (...) {
+        }
+    }
+
     void ConfirmFsr() {
         if (!confirmOpen || confirmKind != 1 || selected >= games.size()) return;
         confirmOpen = false;
@@ -2453,7 +3013,13 @@ struct DashApp : ApplicationT<DashApp> {
 
     void Back() {
         if (toastShown) { HideToast(); return; }
-        if (confirmOpen) { confirmOpen = false; Refresh(false); return; }
+        if (confirmOpen) {
+            if (confirmKind == 5) UpdateSeen();
+            confirmOpen = false;
+            if (confirmKind == 4 || confirmKind == 5) confirmKind = 0;
+            Refresh(false);
+            return;
+        }
         if (detailsOpen) { detailsOpen = false; Refresh(false); return; }
         if (tab == 1) { tab = 0; Refresh(); }
     }
@@ -2467,6 +3033,7 @@ struct DashApp : ApplicationT<DashApp> {
     void Details() {
         if (tab != 0 || games.empty()) return;
         detailsOpen = !detailsOpen;
+        if (detailsOpen && !savesBusy) SaveStatus(L"", true);
         Refresh(false);
     }
 
@@ -2543,6 +3110,12 @@ struct DashApp : ApplicationT<DashApp> {
             wifiWasActive = t.active;
         }
 
+        if (updateReady && tab == 0 && !confirmOpen && !detailsOpen && !launching && !deleting && !toastShown) {
+            updateReady = false;
+            confirmKind = 5;
+            confirmOpen = true;
+            Refresh(false);
+        }
         if (--storageWait <= 0) { storageWait = 150; ShowStorage(); if (MountMissing()) WakeUsb(); } // every 5 s: transfers and deletes change it
         {
             const int state = copyState;
@@ -2579,8 +3152,14 @@ struct DashApp : ApplicationT<DashApp> {
         const uint32_t pressed = buttons & ~padPrevious;
         padPrevious = buttons;
         auto on = [&](GamepadButtons b) { return (pressed & static_cast<uint32_t>(b)) != 0; };
-        if (on(GamepadButtons::A)) { if (confirmOpen) { if (confirmKind == 1) ConfirmFsr(); else if (confirmKind == 2) DeleteConvertedPkgs(); else if (confirmKind == 3) ConfirmUseUp(); else ConfirmDelete(); } else if (tab == 1) CopyUsbSelected(); else Play(); }
-        if (on(GamepadButtons::X)) { if (tab == 1) { if (!confirmOpen) ScanUsb(); } else AskDelete(); }
+        if (on(GamepadButtons::A)) { if (confirmOpen) { if (confirmKind == 5) OpenUpdate(); else if (confirmKind == 4) ConfirmImport(); else if (confirmKind == 1) ConfirmFsr(); else if (confirmKind == 2) DeleteConvertedPkgs(); else if (confirmKind == 3) ConfirmUseUp(); else ConfirmDelete(); } else if (tab == 1) CopyUsbSelected(); else Play(); }
+        if (on(GamepadButtons::X)) {
+            if (tab == 1) { if (!confirmOpen) ScanUsb(); }
+            else if (confirmOpen && confirmKind == 4) NextImport();
+            else if (detailsOpen) AskImport();
+            else AskDelete();
+        }
+        if (on(GamepadButtons::View) && tab == 0 && detailsOpen) ExportSaves();
         if (tab == 1 && !usb.empty() && !usbScanning && !confirmOpen) {
             if (on(GamepadButtons::DPadDown) && usbSelected + 1 < usb.size()) { ++usbSelected; RefreshUsb(); }
             if (on(GamepadButtons::DPadUp) && usbSelected) { --usbSelected; RefreshUsb(); }
@@ -2628,6 +3207,11 @@ struct DashApp : ApplicationT<DashApp> {
         Rescan();
         ShowLastExit();
         if (MountMissing()) WakeUsb();
+#ifndef XSTATION_PUBLIC
+        updateTestDev = Exists(dataRoot + L"\\dev-update-test.txt"); // test switch: the box shows for any release
+#endif
+        CheckForUpdate();
+#ifndef XSTATION_PUBLIC // the dev-*.txt test switches, none in a public build
         // Developer switches for testing with no controller; absent on a normal install.
         const std::wstring devPlayFile = dataRoot + L"\\dev-autoplay.txt", devDeleteFile = dataRoot + L"\\dev-autodelete.txt";
         for (const auto& [file, flag] : {std::pair<std::wstring, bool*>{devPlayFile, &devPlay}, std::pair<std::wstring, bool*>{devDeleteFile, &devDelete}}) {
@@ -2641,6 +3225,18 @@ struct DashApp : ApplicationT<DashApp> {
         }
         // Developer switch for testing Wi-Fi without a controller; absent on a normal install.
         if (Exists(dataRoot + L"\\dev-open-add-page.txt")) tab = 1;
+        // Developer switch (2026-11-15): dev-open-details.txt opens Details on the first game (a screenshot of the panel
+        // without key presses); a line "status" also shows a sample save status. Absent on a normal install.
+        {
+            std::wifstream dev(dataRoot + L"\\dev-open-details.txt");
+            if (dev && !games.empty()) {
+                std::wstring what;
+                dev >> what;
+                detailsOpen = true;
+                if (what == L"status") SaveStatus(L"Exported 16 save files (20 MB) to the USB drive: XStation\\Saves\\" + games[0].id + L"\\2026-11-15 18-40-00", true);
+                if (what == L"error") SaveStatus(L"Couldn't export the saves to the USB drive: create E:\\XStation\\Saves\\x\\savedata\\a (error 5). Your saves on the Xbox weren't changed.", false);
+            }
+        }
         // Developer switch: dev-prepare-test.txt, lines "<title id>|<game folder>": makes each title's images in memory
         // (nothing written) and logs their SHA-256 to xstation-usb.log; absent on a normal install.
         {
@@ -2714,6 +3310,7 @@ struct DashApp : ApplicationT<DashApp> {
                 tab = 1;
             }
         }
+#endif
         {
             std::ofstream log(dataRoot + L"\\xstation-wifi.log", std::ios::app);
             log << "dashboard games=" << games.size() << " tab=" << tab << "\n";
@@ -2730,10 +3327,12 @@ struct DashApp : ApplicationT<DashApp> {
             case VK::Down:
                 if (!games.empty() && selected < games.size() && HasFsrUpscale(games[selected].id)) ToggleUpscale(); else ToggleFps();
                 break;
-            case VK::Enter: if (confirmOpen) { if (confirmKind == 1) ConfirmFsr(); else if (confirmKind == 2) DeleteConvertedPkgs(); else if (confirmKind == 3) ConfirmUseUp(); else ConfirmDelete(); } else if (tab == 1) CopyUsbSelected(); else Play(); break;
+            case VK::Enter: if (confirmOpen) { if (confirmKind == 5) OpenUpdate(); else if (confirmKind == 4) ConfirmImport(); else if (confirmKind == 1) ConfirmFsr(); else if (confirmKind == 2) DeleteConvertedPkgs(); else if (confirmKind == 3) ConfirmUseUp(); else ConfirmDelete(); } else if (tab == 1) CopyUsbSelected(); else Play(); break;
             case VK::X: if (tab == 1) { if (!confirmOpen) ScanUsb(); } else AskDelete(); break;
             case VK::Delete: AskDelete(); break;
             case VK::C: ToggleCpu(); break;
+            case VK::S: ExportSaves(); break;
+            case VK::I: if (confirmOpen && confirmKind == 4) NextImport(); else AskImport(); break;
             case VK::Escape: Back(); break;
             case VK::Y: if (tab == 1) MountSelected(); else Details(); break;
             case VK::Q: SwitchTab(0); break;

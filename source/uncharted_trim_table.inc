@@ -1,0 +1,30 @@
+// Uncharted texture trim (tools/uc_trim_textures.py; Z:/Uncharted-texture-trim-20261112b/trim-report.json, 2026-11-12):
+// file, its original size, the trimmed size and SHA-256. Sizes and hashes only, no game data.
+struct UcTrimFile { const char* relative; uint64_t originalBytes, trimmedBytes; const char* trimmedSha256; };
+const UcTrimFile kUcTrim[] = {
+    {"u1data/build/main/texturedict1/ps4/chunk-1-tstrm-1.pak", 98083184ull, 24928624ull, "117ee395b592b7af5dc7b3728d6395c8b925bd5f8af0288d651110771d03ae3d"},
+    {"u1data/build/main/texturedict1/ps4/chunk-1-tstrm.pak", 1475080064ull, 387444608ull, "f0a8c8b32612c13bd07662555f57a1829adb79ff4de20bc638661e90336d89b7"},
+    {"u1data/build/main/texturedict1/ps4/chunk-2-tstrm.pak", 294506944ull, 74625472ull, "69bbbea33b201bb73c3c02e2801d8034429347083fbae73b5a8ddd98a8300dbd"},
+    {"u1data/build/main/texturedict1/ps4/chunk-3-tstrm.pak", 555256752ull, 140757936ull, "3bb1cfbc58d287c83a4dae97ef60cf47ec619eaad35f8b98f0ae032ce825e7d2"},
+    {"u1data/build/main/texturedict1/ps4/chunk-4-tstrm.pak", 564701376ull, 209938624ull, "8b55cefa6b7912361f1d090787e2e9b5eac336ec155a94f86cb62c3efbf84aa4"},
+    {"u1data/build/main/texturedict1/ps4/chunk-5-tstrm.pak", 218116512ull, 55767456ull, "9742269dd670f9dfe67ccdbe710b2891be0d104240f9f0e13e33353c0ae0f7c4"},
+    {"u1data/build/main/texturedict1/ps4/common-tstrm-1.pak", 842437488ull, 239063920ull, "0c9dee54d1e76dd373f9823bcd70754a3699cfbdc734dec1b5cbfe78191d086a"},
+    {"u1data/build/main/texturedict1/ps4/common-tstrm.pak", 1472263376ull, 373011664ull, "d834face8f05da762620bea989bab57a96d0dde5b9b8ab34261dd74d98068749"},
+    {"u2data/build/main/texturedict1/ps4/chunk-21-tstrm-1.pak", 358934512ull, 96696304ull, "9e801ad88f9e4391a58906adfa75d3e976d192e43888801b7af79677aa026bcc"},
+    {"u2data/build/main/texturedict1/ps4/chunk-21-tstrm.pak", 1473540832ull, 391312096ull, "4a4fb497f6c915d9850a0f139feff82200de9379b2ef7482eb2d411f8e29fdc1"},
+    {"u2data/build/main/texturedict1/ps4/chunk-22-tstrm.pak", 758420448ull, 195138528ull, "ae40a8e4f41e4f8282b37b4f496600eb5dc93308121df887d5933d3494f5a0e8"},
+    {"u2data/build/main/texturedict1/ps4/chunk-23-tstrm.pak", 1265115280ull, 325181584ull, "4b9eb0008c87ebf66e07bf34f089e00a5df00662fbc23c4a1f0723e7ab7a7b38"},
+    {"u2data/build/main/texturedict1/ps4/common-tstrm-1.pak", 1473565856ull, 374109344ull, "bec53f29f81a4e6a3137c15f6f22ac932723f71fb7da5143d32a8ee8da5a19b1"},
+    {"u2data/build/main/texturedict1/ps4/common-tstrm-2.pak", 1475319168ull, 376288640ull, "b6af9f1982af3b47456ccc865b98f56a508002e34a04f37cb21aede8333c4045"},
+    {"u2data/build/main/texturedict1/ps4/common-tstrm-3.pak", 399865296ull, 102561232ull, "2c949b15f56f80a342b47fa19ddede51571032be664517d26e6be5e7b507be4c"},
+    {"u2data/build/main/texturedict1/ps4/common-tstrm.pak", 1470422672ull, 370286224ull, "26a26d1fbcd42fa325627a093ee5f669ba399fd7047ad69ffdbe408f66b76d7c"},
+    {"u3data/build/main/texturedict1/ps4/chunk-41-tstrm-1.pak", 250758160ull, 71906320ull, "cf46f5914261ebfe5b6a5b8400da9ac322afe89be796a871b78c2b4b64e56c54"},
+    {"u3data/build/main/texturedict1/ps4/chunk-41-tstrm.pak", 1477015264ull, 380597984ull, "1d5f962933f4f5088bc6173f0de69137842d60988ed03978a09f7567402ed9e3"},
+    {"u3data/build/main/texturedict1/ps4/chunk-42-tstrm.pak", 975879024ull, 257112944ull, "152def963235f02a65e8f92be5650bfedb01e41f39a32d54a180495b5c589c55"},
+    {"u3data/build/main/texturedict1/ps4/chunk-43-tstrm.pak", 822175296ull, 210716224ull, "52a3e16ac26539348940dd20b2a1378416ae33e1c5d0b851445128e9edce8a0e"},
+    {"u3data/build/main/texturedict1/ps4/common-tstrm-1.pak", 1472557904ull, 378762064ull, "3cb134023922750f29a79f020a01aad35b963130d5bc4188653b9e0e1193b0f6"},
+    {"u3data/build/main/texturedict1/ps4/common-tstrm-2.pak", 1475623984ull, 381353008ull, "da8174f8d432705093b224ae08bbe040f6187ace98d90438d8f224eaca4032f0"},
+    {"u3data/build/main/texturedict1/ps4/common-tstrm-3.pak", 1475123936ull, 376593120ull, "87bd7eddf6bd3768c78aff7bb57dcce9b21e6e79d5012a3bfb261a63396a053e"},
+    {"u3data/build/main/texturedict1/ps4/common-tstrm-4.pak", 269511760ull, 68709456ull, "842556ca5f88fdf2a3f92182ad8c244814e3061d518dbf01c54887701f9f9c07"},
+    {"u3data/build/main/texturedict1/ps4/common-tstrm.pak", 1472528112ull, 372293360ull, "611f4398bab453d197fedc1e17b193818a12d1c1b0d6c46d7e0beb299dbd1176"},
+};
