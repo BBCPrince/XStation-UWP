@@ -11,6 +11,8 @@
 #include <array>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
@@ -839,6 +841,11 @@ bool GamePrepareImages(const std::wstring& titleId, const std::wstring& gameData
     return true;
 }
 
+namespace {
+bool FinishPrepare(const Recipe* recipe, const std::wstring& gameFolder, const std::wstring& engineDir, const Bytes& boot, const Bytes& content,
+                   const Bytes& memory, std::wstring& error, std::string& detail);
+}
+
 bool GamePrepare(const std::wstring& titleId, const std::wstring& gameFolder, const std::wstring& engineDir, std::wstring& error, std::string& detail) {
     const Recipe* recipe = FindRecipe(titleId);
     if (!recipe) { error = L"XStation can't prepare this game on the console yet."; return false; }
@@ -848,6 +855,13 @@ bool GamePrepare(const std::wstring& titleId, const std::wstring& gameFolder, co
         error = L"This game's version doesn't match the one its engine was built for, so it can't run yet.";
         return false;
     }
+    return FinishPrepare(recipe, gameFolder, engineDir, boot, content, memory, error, detail);
+}
+
+namespace {
+bool FinishPrepare(const Recipe* recipe, const std::wstring& gameFolder, const std::wstring& engineDir, const Bytes& boot, const Bytes& content,
+                   const Bytes& memory, std::wstring& error, std::string& detail) {
+    const std::wstring titleId = recipe->title; // the engine's title: its asset steps
     std::vector<std::pair<std::wstring, Bytes>> patches;
     if (recipe->copyPatches) {
         try {
@@ -873,4 +887,74 @@ bool GamePrepare(const std::wstring& titleId, const std::wstring& gameFolder, co
     ok = ok && WriteAll(out + L"\\boot-linked.bin", boot); // last: the dashboard treats this file as "prepared"
     if (!ok) { error = L"Couldn't write the prepared image."; return false; }
     return true;
+}
+
+std::mutex g_engineLock;
+std::wstring g_aliasFile;
+std::map<std::wstring, std::wstring> g_aliases; // title ID -> engine title ID
+bool IsFolder(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    return GetFileAttributesExFromAppW(path.c_str(), GetFileExInfoStandard, &a) && (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+bool Usable(const std::wstring& id) {
+    if (id.empty() || id.size() > 15) return false;
+    for (const wchar_t c : id) if (!iswalnum(c)) return false;
+    return true;
+}
+} // namespace
+
+void GameEnginesConfigure(const std::wstring& localState) {
+    std::lock_guard<std::mutex> lock(g_engineLock);
+    g_aliasFile = localState + L"\\engine-aliases.txt";
+    g_aliases.clear();
+    std::wifstream in(g_aliasFile);
+    std::wstring line;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
+        const size_t tab = line.find(L'\t');
+        if (tab == std::wstring::npos) continue;
+        const std::wstring id = line.substr(0, tab), engine = line.substr(tab + 1);
+        if (Usable(id) && FindRecipe(engine) && !FindRecipe(id)) g_aliases[id] = engine;
+    }
+}
+
+std::wstring GameEngineId(const std::wstring& titleId) {
+    std::lock_guard<std::mutex> lock(g_engineLock);
+    const auto it = g_aliases.find(titleId);
+    return it == g_aliases.end() ? titleId : it->second;
+}
+
+bool GamePrepareAny(const std::wstring& titleId, const std::wstring& gameFolder, const std::wstring& enginesRoot, std::wstring& engineId,
+                    std::wstring& error, std::string& detail) {
+    engineId = GameEngineId(titleId);
+    if (FindRecipe(engineId)) return GamePrepare(engineId, gameFolder, enginesRoot + L"\\" + engineId, error, detail);
+    // No engine of its own: another region's copy, or another game. Each engine's exact image is tried.
+    detail += "no engine for " + std::string(titleId.begin(), titleId.end()) + ": trying every engine's game image\n";
+    for (const auto& r : kRecipes) {
+        const std::wstring engineDir = enginesRoot + L"\\" + r.title;
+        const std::string name(r.title, r.title + wcslen(r.title));
+        if (!IsFolder(engineDir)) { detail += "  " + name + ": no engine folder\n"; continue; }
+        const std::wstring own = gameFolder + L"\\" + r.dataFolder, plain = gameFolder + L"\\GameData";
+        const std::wstring data = IsFolder(own) ? own : plain;
+        if (!IsFolder(data)) { detail += "  " + name + ": no game data folder\n"; continue; }
+        std::vector<uint8_t> boot, content, memory;
+        std::wstring e;
+        std::string d;
+        const bool built = GamePrepareImages(r.title, data, engineDir, boot, content, e, d, &memory);
+        const bool same = built && HexSha256(boot) == r.sha256 && (!r.guardSites || HexSha256(memory) == r.guardSha256);
+        detail += "  " + std::string(r.title, r.title + wcslen(r.title)) + ": " + (same ? "same image" : built ? "different image" : "can't link") + "\n";
+        if (!same) continue;
+        if (data != own && !MoveFileFromAppW(data.c_str(), own.c_str())) { error = L"Couldn't rename the game's data folder for its engine."; return false; }
+        if (!FinishPrepare(&r, gameFolder, engineDir, boot, content, memory, error, detail)) return false;
+        engineId = r.title;
+        {
+            std::lock_guard<std::mutex> lock(g_engineLock);
+            g_aliases[titleId] = r.title;
+            std::wofstream out(g_aliasFile, std::ios::trunc);
+            for (const auto& [id, engine] : g_aliases) out << id << L"\t" << engine << L"\n";
+        }
+        return true;
+    }
+    error = L"XStation has no engine for this game, or for this region or version of it, yet.";
+    return false;
 }

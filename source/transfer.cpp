@@ -44,7 +44,7 @@ main{max-width:640px;margin:0 auto;padding:28px 16px}h1{font-size:24px;letter-sp
 section{background:#16213a;border:1px solid #2a3858;border-radius:10px;padding:16px;margin:14px 0}h2{font-size:17px;margin:0 0 4px}p{margin:0 0 10px;color:#b9c4d8;font-size:14px}
 label{display:block;font-size:14px;margin-bottom:6px}input[type=text]{font:22px monospace;letter-spacing:.2em;width:9ch;background:#0c1424;color:#fff;border:1px solid #47587e;border-radius:6px;padding:6px 10px}
 input[type=file]{display:block;max-width:100%;margin-bottom:10px}button{font:600 15px "Segoe UI",sans-serif;background:#fff;color:#0c1424;border:0;border-radius:6px;padding:9px 18px;cursor:pointer}button:disabled{opacity:.5}
-progress{width:100%;height:14px;margin-top:6px}#status{font-size:14px;word-break:break-word;min-height:42px}
+progress{width:100%;height:14px;margin-top:6px}#status{font-size:14px;word-break:break-word;min-height:42px;white-space:pre-line}
 </style><main><h1>XSTATION</h1>
 <section><label for="code">Pairing code shown on the Xbox</label><input id="code" type="text" inputmode="numeric" maxlength="6" autocomplete="off"></section>
 <section><h2>Prepared game folder</h2><p>Choose the folder the PC import tool made (named like CUSA07408). It shows up under Games after you restart XStation.</p><input id="dir" type="file" webkitdirectory><button id="sendDir">Send folder</button></section>
@@ -70,10 +70,13 @@ async function send(list,lanes=4){ if(busy)return; const code=$("code").value.tr
  for(const x of list){if(!x.path.startsWith("Import/"))continue;$("status").textContent="Checking "+x.file.name+"\u2026";const i=await pkgInfo(x.file);if(!i||!i.cat)continue;
   const r=await fetch("/pkgcheck?id="+encodeURIComponent(i.id)+"&cat="+encodeURIComponent(i.cat),{headers:{"X-Pair-Code":code}}).catch(()=>null);
   if(r&&r.status==409){$("status").textContent=(i.title?i.title+": ":"")+await r.text();return}}
+ const top=list[0].path.split("/").slice(0,2).join("/");if(top.startsWith("Games/")){$("status").textContent="Checking free space…";
+  const r=await fetch("/spacecheck?bytes="+list.reduce((a,x)=>a+x.file.size,0)+"&folder="+encodeURIComponent(top),{headers:{"X-Pair-Code":code}}).catch(()=>null);
+  if(r&&r.status==507){$("status").textContent=await r.text();return}}
  busy=true;$("sendDir").disabled=$("sendPkg").disabled=true;const total=list.reduce((a,x)=>a+x.file.size,0);let done=0,next=0,fail=null,count=0;const live=new Map();
  const paint=(n)=>{const now=done+[...live.values()].reduce((a,b)=>a+b,0);$("bar").value=total?now/total:1;$("status").textContent=fmt(now)+" of "+fmt(total)+" · "+count+" of "+list.length+" files · "+n};
  const one=x=>new Promise((res,rej)=>{const r=new XMLHttpRequest();r.open("PUT","/upload?path="+encodeURIComponent(x.path));r.setRequestHeader("X-Pair-Code",code);
-  r.upload.onprogress=e=>{live.set(x.path,e.loaded);paint(x.path)};r.onload=()=>{live.delete(x.path);r.status<300?res():rej(new Error(r.status==403?"Wrong pairing code.":r.status==507?"The Xbox is out of space.":r.status==409&&r.responseText?r.responseText:"Upload failed ("+r.status+"): "+x.path))};r.onerror=async()=>{live.delete(x.path);let m="";if(x.path.startsWith("Import/")){const q=await fetch("/pkgresult",{headers:{"X-Pair-Code":code}}).catch(()=>null);if(q&&q.status==409)m=await q.text()}rej(new Error(m||"Connection lost at "+x.path))};r.send(x.file)});
+  r.upload.onprogress=e=>{live.set(x.path,e.loaded);paint(x.path)};r.onload=()=>{live.delete(x.path);r.status<300?res():rej(new Error(r.status==403?"Wrong pairing code.":r.status==507?(r.responseText&&!r.responseText.startsWith("507")?r.responseText:"Not enough storage on the Xbox. Free up space and try again."):r.status==409&&r.responseText?r.responseText:"Upload failed ("+r.status+"): "+x.path))};r.onerror=async()=>{live.delete(x.path);let m="";if(x.path.startsWith("Import/")){const q=await fetch("/pkgresult",{headers:{"X-Pair-Code":code}}).catch(()=>null);if(q&&q.status==409)m=await q.text()}rej(new Error(m||"Connection lost at "+x.path))};r.send(x.file)});
  const worker=async()=>{while(!fail&&next<list.length){const x=list[next++];try{await one(x);done+=x.file.size;count++;paint(x.path)}catch(e){fail=e}}};
  await Promise.all(Array.from({length:lanes},worker));
  $("status").textContent=fail?fail.message:"Done: "+count+" files, "+fmt(total)+". Restart XStation to see new games.";busy=false;$("sendDir").disabled=$("sendPkg").disabled=false}
@@ -269,6 +272,39 @@ void PkgCheck(SOCKET s, const std::string& head, const std::string& target) {
     Plain(s, "204 No Content");
 }
 
+uint64_t FolderBytes(const std::wstring& folder, int depth = 0) {
+    if (depth > 32) return 0;
+    WIN32_FIND_DATAW f;
+    HANDLE h = FindFirstFileExW((folder + L"\\*").c_str(), FindExInfoBasic, &f, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    uint64_t sum = 0;
+    do {
+        if (!wcscmp(f.cFileName, L".") || !wcscmp(f.cFileName, L"..") || (f.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) sum += FolderBytes(folder + L"\\" + f.cFileName, depth + 1);
+        else sum += (uint64_t(f.nFileSizeHigh) << 32) | f.nFileSizeLow;
+    } while (FindNextFileW(h, &f));
+    FindClose(h);
+    return sum;
+}
+
+// 2026-11-18: GET
+// /spacecheck?bytes=<total>&folder=Games/<name>, before a game folder is sent: 507 + the not-enough-storage message when
+// it doesn't fit, else 204. Files already in that folder count as room (sending again replaces them).
+void SpaceCheck(SOCKET s, const std::string& head, const std::string& target) {
+    if (!Paired(s, head)) return;
+    const uint64_t bytes = _strtoui64(Query(target, "bytes").c_str(), nullptr, 10);
+    const std::string name = Query(target, "folder");
+    std::wstring folder;
+    const uint64_t present = name.rfind("Games/", 0) == 0 && SafePath(name, folder) ? FolderBytes(root + L"\\" + folder) : 0;
+    const uint64_t need = (bytes > present ? bytes - present : 0) + (512ull << 20);
+    ULARGE_INTEGER freeBytes{};
+    if (bytes && GetDiskFreeSpaceExW(root.c_str(), &freeBytes, nullptr, nullptr) && need > freeBytes.QuadPart) {
+        Message(s, "507 Insufficient Storage", NotEnoughStorageText(need, freeBytes.QuadPart, L"the Xbox"));
+        return;
+    }
+    Plain(s, "204 No Content");
+}
+
 void Upload(SOCKET s, const std::string& head, const std::string& target, const char* extra, size_t extraSize) {
     if (wrongCodes.load() >= 20) { Plain(s, "403 Forbidden"); return; }
     if (Header(head, "x-pair-code") != code) { ++wrongCodes; Plain(s, "403 Forbidden"); return; }
@@ -283,13 +319,26 @@ void Upload(SOCKET s, const std::string& head, const std::string& target, const 
         GetFileAttributesW((root + L"\\Import\\stream-off.txt").c_str()) == INVALID_FILE_ATTRIBUTES) {
         if (streaming.exchange(true)) { Message(s, "409 Conflict", L"Another PKG is being converted. Send PKGs one at a time."); return; }
         ULARGE_INTEGER space{};
-        if (GetDiskFreeSpaceExW(root.c_str(), &space, nullptr, nullptr) && space.QuadPart < (2ull << 30)) { streaming = false; Plain(s, "507 Insufficient Storage"); return; }
+        if (GetDiskFreeSpaceExW(root.c_str(), &space, nullptr, nullptr) && space.QuadPart < (2ull << 30)) {
+            streaming = false;
+            // The game's size is known only once the PKG's file table arrives (PkgStream); under 2 GB nothing fits.
+            wchar_t text[300];
+            swprintf_s(text, L"Not enough storage. The Xbox has only %.1f GB free, and a game needs much more (about as much as its PKG, "
+                             L"often more). Free up space (delete games or files you don't need) and try again.",
+                       space.QuadPart / 1073741824.0);
+            Message(s, "507 Insufficient Storage", text);
+            return;
+        }
         UploadPkg(s, relative, length, extra, extraSize);
         streaming = false;
         return;
     }
     ULARGE_INTEGER freeBytes{};
-    if (GetDiskFreeSpaceExW(root.c_str(), &freeBytes, nullptr, nullptr) && freeBytes.QuadPart < length + (64ull << 20)) { Plain(s, "507 Insufficient Storage"); return; }
+    if (GetDiskFreeSpaceExW(root.c_str(), &freeBytes, nullptr, nullptr) && freeBytes.QuadPart < length + (64ull << 20)) {
+        Message(s, "507 Insufficient Storage", NotEnoughStorageText(length + (64ull << 20), freeBytes.QuadPart, L"the Xbox",
+                                                                     L"Not enough storage for " + relative + L"."));
+        return;
+    }
     const std::wstring file = root + L"\\" + relative, part = file + L".part";
     MakeParents(file);
     HANDLE h = CreateFile2(part.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
@@ -345,6 +394,7 @@ void Connection(SOCKET s) {
         else { ++wrongCodes; Plain(s, "403 Forbidden"); }
     }
     else if (method == "GET" && target.rfind("/pkgcheck?", 0) == 0) PkgCheck(s, head, target);
+    else if (method == "GET" && target.rfind("/spacecheck?", 0) == 0) SpaceCheck(s, head, target);
     else if (method == "GET" && target == "/pkgresult") {
         if (Paired(s, head)) {
             std::wstring why;
@@ -388,7 +438,11 @@ bool StartTransferServer(const std::wstring& dataRoot, std::string& pairingCode,
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons((u_short)port);
+#ifdef XSTATION_TRANSFER_LOOPBACK
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // PC test tool (tools/pkgtest xfertest): this PC only, no firewall prompt
+#else
     address.sin_addr.s_addr = htonl(INADDR_ANY);
+#endif
     if (bind(listener, (sockaddr*)&address, sizeof(address))) { note("bind", WSAGetLastError()); closesocket(listener); running = false; return false; }
     if (listen(listener, 16)) { note("listen", WSAGetLastError()); closesocket(listener); running = false; return false; }
     note("listening", port);

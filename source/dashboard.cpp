@@ -81,15 +81,34 @@ const Tested kTested[] = {
     {L"CUSA00900", L"About 59 FPS", L"Reduced quality"},
     {L"CUSA00552", L"About 30 FPS", L"Experimental"},
     {L"CUSA07408", L"About 15 FPS", L"Experimental"},
+    {L"CUSA08344", L"About 25 FPS", L"Playable"}, // 2026-11-18: intro ~28, chapter 1 22-25 FPS, looks right
     {L"CUSA02299", L"No gameplay yet", L"Crashes early"},
 };
 
+// 2026-11-18: the Compatible tab.
+// One row per engine the package has, with the exact copy that engine was made from. Other regions' copies work when
+// their game code is the same (GamePrepareAny checks it when the game is added).
+struct Compatible { const wchar_t* id; const wchar_t* name; const wchar_t* version; const wchar_t* region; };
+const Compatible kCompatible[] = {
+    {L"CUSA02343", L"Uncharted: The Nathan Drake Collection", L"1.00, no update", L"Europe"},
+    {L"CUSA00900", L"Bloodborne", L"1.09 (game + update 1.09)", L"US"},
+    {L"CUSA00552", L"The Last of Us Remastered", L"1.00, no update", L"US"},
+    {L"CUSA08344", L"Detroit: Become Human", L"1.00, no update", L"US"},
+    {L"CUSA07408", L"God of War", L"1.35 (game + update 1.35)", L"US"},
+};
+
 // Games with no 30/60 FPS choice (the user's decision, 2026-11-07): God of War, Spider-Man.
-bool HasFpsChoice(const std::wstring& id) { return id != L"CUSA07408" && id != L"CUSA02299"; }
+bool HasFpsChoice(const std::wstring& title) { const auto id = GameEngineId(title); return id != L"CUSA07408" && id != L"CUSA02299"; }
 // Games whose 60 is FSR frame generation (the engine has their camera hookup), 30 by default (2026-11-09).
-bool HasFsrChoice(const std::wstring& id) { return id == L"CUSA00552"; }
+bool HasFsrChoice(const std::wstring& title) { return GameEngineId(title) == L"CUSA00552"; }
 // Games with FSR 3.1 upscaling (their engine has the camera hookup and the upscale trigger): Bloodborne (2026-11-09).
-bool HasFsrUpscale(const std::wstring& id) { return id == L"CUSA00900"; }
+bool HasFsrUpscale(const std::wstring& title) { return GameEngineId(title) == L"CUSA00900"; }
+// 2026-11-17 (other regions): the engine folder of a title (its own, or the one its image matched).
+bool EngineExists(const std::wstring& package, const std::wstring& title) {
+    const std::wstring dir = package + L"\\Engines\\" + GameEngineId(title);
+    const DWORD a1 = GetFileAttributesW((dir + L"\\tlou-uwp-runtime.dll").c_str()), a2 = GetFileAttributesW((dir + L"\\bb-uwp-runtime.dll").c_str());
+    return a1 != INVALID_FILE_ATTRIBUTES || a2 != INVALID_FILE_ATTRIBUTES;
+}
 
 struct Game {
     std::wstring id, title, version, folder, uriBase, icon, hero;
@@ -209,7 +228,7 @@ std::wstring SaveFolder(const std::wstring& local, const std::wstring& id) {
     const std::wstring title = local + L"\\Titles\\" + id;
     for (const wchar_t* user : {L"game-user", L"tlou-bb194-user"})
         if (IsFolderFromApp(title + L"\\" + user + L"\\savedata")) return title + L"\\" + user + L"\\savedata";
-    return title + (id == L"CUSA00900" ? L"\\game-user\\savedata" : L"\\tlou-bb194-user\\savedata");
+    return title + (GameEngineId(id) == L"CUSA00900" ? L"\\game-user\\savedata" : L"\\tlou-bb194-user\\savedata");
 }
 std::wstring SaveStamp() {
     SYSTEMTIME t;
@@ -298,7 +317,7 @@ void ScanGames(const std::wstring& root, const std::wstring& package, const std:
         }
         g.hasBoot = Exists(g.folder + (update109 ? L"\\GameBoot109\\boot-linked.bin" : L"\\GameBoot\\boot-linked.bin"));
         g.copying = Exists(g.folder + L"\\.xstation-copying");
-        g.hasEngine = Exists(package + L"\\Engines\\" + id + L"\\tlou-uwp-runtime.dll") || Exists(package + L"\\Engines\\" + id + L"\\bb-uwp-runtime.dll");
+        g.hasEngine = EngineExists(package, id);
         std::ifstream info(g.folder + L"\\xstation-game.txt");
         if (info) info >> g.bytes;
         ReadStats(local + L"\\Titles\\" + id + L"\\stats.txt", g);
@@ -499,6 +518,8 @@ struct DashApp : ApplicationT<DashApp> {
     Grid usbBar{nullptr}, copyBar{nullptr};
     StackPanel copyRow{nullptr};
     StackPanel usbList{nullptr}, hintsGames{nullptr}, hintsAdd{nullptr};
+    StackPanel compatPage{nullptr}, compatList{nullptr}, hintsCompat{nullptr}; // tab 2, Compatible (2026-11-18)
+    TextBlock tabCompat{nullptr};
     std::vector<Game> games;
     size_t selected = 0;
     int tab = 0;
@@ -799,12 +820,15 @@ struct DashApp : ApplicationT<DashApp> {
         tabs.Children().Append(Chip(L"LB"));
         tabGames = Text(L"Games", 18);
         tabAdd = Text(L"Add Game", 18);
+        tabCompat = Text(L"Compatible", 18);
         tabGames.VerticalAlignment(VerticalAlignment::Center);
         tabAdd.VerticalAlignment(VerticalAlignment::Center);
+        tabCompat.VerticalAlignment(VerticalAlignment::Center);
         tabs.VerticalAlignment(VerticalAlignment::Top);
         tabs.Height(28);
         tabs.Children().Append(tabGames);
         tabs.Children().Append(tabAdd);
+        tabs.Children().Append(tabCompat);
         tabs.Children().Append(Chip(L"RB"));
         header.Children().Append(tabs);
         StackPanel right;
@@ -1047,6 +1071,26 @@ struct DashApp : ApplicationT<DashApp> {
         usbText = Text(L"", 13);
         canvas.Children().Append(addPage);
 
+        // Compatible page (2026-11-18): every game this package has an engine for (RefreshCompat fills the rows).
+        compatPage = StackPanel();
+        compatPage.Margin(Thickness{kMarginX, 66, kMarginX, 50});
+        compatPage.Spacing(8);
+        compatPage.Visibility(Visibility::Collapsed);
+        compatPage.Children().Append(Text(L"Games XStation can play", 14, White(165)));
+        compatList = StackPanel();
+        compatList.Spacing(6);
+        compatPage.Children().Append(compatList);
+        {
+            auto note = Text(L"Each game needs the exact version listed. A copy from another region works too when its game code is "
+                             L"the same, and XStation checks this when you add the game. Speeds were measured on an Xbox Series X.",
+                             12, White(150));
+            note.TextWrapping(TextWrapping::Wrap);
+            note.TextTrimming(TextTrimming::None);
+            note.Margin(Thickness{0, 6, 0, 0});
+            compatPage.Children().Append(note);
+        }
+        canvas.Children().Append(compatPage);
+
         // Hints
         Grid hints;
         hints.Height(36);
@@ -1077,6 +1121,13 @@ struct DashApp : ApplicationT<DashApp> {
         hintsAdd.Children().Append(Hint(L"X", L"RESCAN", Color{255, 40, 90, 170}));
         hintsAdd.Children().Append(Hint(L"B", L"BACK", Color{255, 170, 44, 44}));
         hints.Children().Append(hintsAdd);
+        hintsCompat = StackPanel();
+        hintsCompat.Orientation(Orientation::Horizontal);
+        hintsCompat.HorizontalAlignment(HorizontalAlignment::Right);
+        hintsCompat.Spacing(18);
+        hintsCompat.Visibility(Visibility::Collapsed);
+        hintsCompat.Children().Append(Hint(L"B", L"BACK", Color{255, 170, 44, 44}));
+        hints.Children().Append(hintsCompat);
         notice = Text(L"", 12, White(220));
         notice.VerticalAlignment(VerticalAlignment::Center);
         notice.MaxWidth(620);
@@ -1252,7 +1303,7 @@ struct DashApp : ApplicationT<DashApp> {
                 g.folder = m.folder;
                 g.mounted = true;
                 g.usbMissing = checked; // not read yet: listed from mounts.txt until the worker has looked
-                g.hasEngine = Exists(package + L"\\Engines\\" + m.id + L"\\tlou-uwp-runtime.dll") || Exists(package + L"\\Engines\\" + m.id + L"\\bb-uwp-runtime.dll");
+                g.hasEngine = EngineExists(package, m.id);
                 ReadStats(local + L"\\Titles\\" + m.id + L"\\stats.txt", g);
                 games.push_back(g);
             }
@@ -1384,13 +1435,76 @@ struct DashApp : ApplicationT<DashApp> {
         board.Begin();
     }
 
+    // The Compatible tab's rows: name, the exact version and copy, speed and status on the Xbox, and whether it's in the
+    // library (under its own ID, or another region's copy that runs with this engine).
+    void RefreshCompat() {
+        compatList.Children().Clear();
+        size_t shown = 0;
+        for (const auto& c : kCompatible) {
+            if (!EngineExists(package, c.id)) continue;
+            ++shown;
+            std::wstring speed = L"Not tested", status = L"";
+            for (const auto& t : kTested) if (!wcscmp(t.id, c.id)) { speed = t.speed; status = t.status; }
+            std::wstring have;
+            for (const auto& g : games) {
+                if (GameEngineId(g.id) != c.id) continue;
+                have = g.id == c.id ? L"In your library" : L"In your library (" + g.id + L")";
+                break;
+            }
+            Border row;
+            row.CornerRadius(CornerRadius{10, 10, 10, 10});
+            row.Background(White(16));
+            row.Padding(Thickness{16, 10, 16, 10});
+            Grid g;
+            ColumnDefinition c0, c1, c2;
+            c0.Width(GridLengthHelper::FromValueAndType(1, GridUnitType::Star));
+            c1.Width(GridLengthHelper::FromPixels(190));
+            c2.Width(GridLengthHelper::FromPixels(190));
+            g.ColumnDefinitions().Append(c0);
+            g.ColumnDefinitions().Append(c1);
+            g.ColumnDefinitions().Append(c2);
+            StackPanel left;
+            left.Spacing(2);
+            left.VerticalAlignment(VerticalAlignment::Center);
+            auto name = Text(c.name, 17);
+            name.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+            left.Children().Append(name);
+            left.Children().Append(Text(L"Version " + std::wstring(c.version) + L"  ·  " + c.region + L" copy (" + c.id + L")", 12, White(170)));
+            g.Children().Append(left);
+            StackPanel mid;
+            mid.Spacing(2);
+            mid.VerticalAlignment(VerticalAlignment::Center);
+            mid.Children().Append(Text(speed, 15));
+            mid.Children().Append(Text(status.empty() ? L"" : status, 12, White(170)));
+            Grid::SetColumn(mid, 1);
+            g.Children().Append(mid);
+            if (!have.empty()) {
+                Border chip;
+                chip.CornerRadius(CornerRadius{12, 12, 12, 12});
+                chip.Background(Solid(110, 40, 140, 70));
+                chip.Padding(Thickness{10, 4, 10, 4});
+                chip.HorizontalAlignment(HorizontalAlignment::Right);
+                chip.VerticalAlignment(VerticalAlignment::Center);
+                chip.Child(Text(have, 12));
+                Grid::SetColumn(chip, 2);
+                g.Children().Append(chip);
+            }
+            row.Child(g);
+            compatList.Children().Append(row);
+        }
+        if (!shown) compatList.Children().Append(Text(L"This XStation has no game engines.", 15, White(200)));
+    }
+
     void Refresh(bool heroChanged = true) {
         tabGames.Foreground(tab == 0 ? White() : White(130));
         tabAdd.Foreground(tab == 1 ? White() : White(130));
         tabGames.FontWeight(tab == 0 ? Windows::UI::Text::FontWeights::SemiBold() : Windows::UI::Text::FontWeights::Normal());
         tabAdd.FontWeight(tab == 1 ? Windows::UI::Text::FontWeights::SemiBold() : Windows::UI::Text::FontWeights::Normal());
+        tabCompat.Foreground(tab == 2 ? White() : White(130));
+        tabCompat.FontWeight(tab == 2 ? Windows::UI::Text::FontWeights::SemiBold() : Windows::UI::Text::FontWeights::Normal());
         gamesPage.Visibility(tab == 0 ? Visibility::Visible : Visibility::Collapsed);
         addPage.Visibility(tab == 1 ? Visibility::Visible : Visibility::Collapsed);
+        compatPage.Visibility(tab == 2 ? Visibility::Visible : Visibility::Collapsed);
         details.Visibility(detailsOpen || confirmOpen ? Visibility::Visible : Visibility::Collapsed);
         detailsText.Visibility(confirmOpen ? Visibility::Visible : Visibility::Collapsed);
         if (detailsView) detailsView.Visibility(detailsOpen && !confirmOpen ? Visibility::Visible : Visibility::Collapsed);
@@ -1444,6 +1558,12 @@ struct DashApp : ApplicationT<DashApp> {
         }
         hintsGames.Visibility(tab == 0 ? Visibility::Visible : Visibility::Collapsed);
         hintsAdd.Visibility(tab == 1 ? Visibility::Visible : Visibility::Collapsed);
+        hintsCompat.Visibility(tab == 2 ? Visibility::Visible : Visibility::Collapsed);
+        if (tab == 2) {
+            hero.Opacity(0.25);
+            RefreshCompat();
+            return;
+        }
         if (tab == 1) {
             hero.Opacity(0.25);
             StartWifi();
@@ -1513,7 +1633,7 @@ struct DashApp : ApplicationT<DashApp> {
 
         std::wstring speed = L"Not tested", status = L"Unknown", statusSub = L"Ready to start";
         for (const auto& t : kTested) {
-            if (g.id == t.id) { speed = t.speed; status = t.status; statusSub = L"Ready to start"; }
+            if (GameEngineId(g.id) == t.id) { speed = t.speed; status = t.status; statusSub = L"Ready to start"; }
         }
         if (!g.hasEngine) { status = L"No engine"; statusSub = L"This game can't start yet"; }
         else if (g.usbMissing) { status = L"USB drive missing"; statusSub = L"Plug it in to play"; }
@@ -1595,13 +1715,13 @@ struct DashApp : ApplicationT<DashApp> {
         bool mounted = false;
         for (const auto& m : ReadMounts()) if (m.id == item.id && m.folder == item.path) mounted = true;
         return item.title + L"   (" + item.id + L")   " + (item.bytes ? FormatBytes(item.bytes) + L"   " : L"") +
-               (!item.prepared ? (GamePrepareSupported(item.id) ? L"not prepared   A prepares it" : L"not prepared") : mounted ? L"MOUNTED" : L"");
+               (!item.prepared ? (GamePrepareSupported(GameEngineId(item.id)) ? L"not prepared   A prepares it" : L"not prepared   A checks it") : mounted ? L"MOUNTED" : L"");
     }
 
     // What A and Y do for an item on the drive (empty: nothing).
     std::wstring UsbAction(const UsbItem& item) const {
         if (item.pkg) return item.id.empty() ? L"" : L"Convert";
-        if (!item.prepared) return GamePrepareSupported(item.id) ? L"Prepare" : L"";
+        if (!item.prepared) return GamePrepareSupported(GameEngineId(item.id)) ? L"Prepare" : L"Check";
         return L"Copy to Xbox";
     }
     std::wstring UsbYAction(const UsbItem& item, const std::vector<Mount>& mounts) const {
@@ -1664,7 +1784,7 @@ struct DashApp : ApplicationT<DashApp> {
         } else if (!item.prepared) {
             chip = L"Not prepared";
             chipColor = Color{255, 133, 79, 11};
-            sub = L"Game folder" + (item.bytes ? L" \u00B7 " + FormatBytes(item.bytes) : L"") + (GamePrepareSupported(item.id) ? L"" : L" \u00B7 can't be prepared here yet");
+            sub = L"Game folder" + (item.bytes ? L" \u00B7 " + FormatBytes(item.bytes) : L"") + (GamePrepareSupported(GameEngineId(item.id)) ? L"" : L" \u00B7 another region? A checks it");
         } else if (mounted) {
             chip = L"Mounted";
             chipColor = Color{255, 24, 95, 165};
@@ -2058,7 +2178,7 @@ struct DashApp : ApplicationT<DashApp> {
         copyFilesTotal = files.size();
         ULARGE_INTEGER freeBytes{};
         if (GetDiskFreeSpaceExW(dataRoot.c_str(), &freeBytes, nullptr, nullptr) && total - present + (512ull << 20) > freeBytes.QuadPart) {
-            fail(L"Not enough space on the Xbox: it needs " + FormatBytes(total - present) + L", and " + FormatBytes(freeBytes.QuadPart) + L" is free.");
+            fail(NotEnoughStorageText(total - present + (512ull << 20), freeBytes.QuadPart, L"the Xbox")); // 2026-11-18
             return;
         }
         UsbLog(L"copy " + source + L" -> " + target + L": " + std::to_wstring(files.size()) + L" files, " + std::to_wstring(total) + L" bytes, " + std::to_wstring(present) + L" already there");
@@ -2170,11 +2290,6 @@ struct DashApp : ApplicationT<DashApp> {
     // A on a game folder on the drive without its prepared image: make it on the console.
     void PrepareUsbSelected() {
         const UsbItem item = usb[usbSelected];
-        if (!GamePrepareSupported(item.id)) {
-            usbStatus = item.title + L" isn't prepared, and XStation can't prepare it on the console yet. Make the folder with xstation_import.py on your PC.";
-            RefreshUsb();
-            return;
-        }
         {
             std::lock_guard<std::mutex> lock(copyLock);
             copyError.clear();
@@ -2196,7 +2311,8 @@ struct DashApp : ApplicationT<DashApp> {
             std::string detail;
             std::wstring err;
             const auto began = std::chrono::steady_clock::now();
-            const bool ok = GamePrepare(id, folder, package + L"\\Engines\\" + id, err, detail);
+            std::wstring engine;
+            const bool ok = GamePrepareAny(id, folder, package + L"\\Engines", engine, err, detail);
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
             UsbLog(L"prepare " + id + L": " + (ok ? L"done" : err) + L" in " + std::to_wstring((int)s) + L" s\n" + FromUtf8(detail));
             {
@@ -2220,7 +2336,7 @@ struct DashApp : ApplicationT<DashApp> {
         const size_t slash = item.path.find(L'\\');
         const std::wstring root = slash == std::wstring::npos ? item.path : item.path.substr(0, slash);
         // Bloodborne's engine uses its 1.09 folder names (GameData109).
-        const std::wstring target = root + L"\\XStation\\" + item.id, data = target + L"\\" + GamePrepareDataFolder(item.id),
+        const std::wstring target = root + L"\\XStation\\" + item.id, data = target + L"\\" + GamePrepareDataFolder(GameEngineId(item.id)),
                            marker = target + L"\\.xstation-converting";
         // 2026-11-14: an update for a game already converted on the drive goes on top of it (only the update's files are
         // written), so a game converted without its update doesn't have to be converted again.
@@ -2284,18 +2400,15 @@ struct DashApp : ApplicationT<DashApp> {
                     size << convertProgress.total.load();
                 }
                 const std::wstring id = target.substr(target.find_last_of(L'\\') + 1);
-                if (GamePrepareSupported(id)) {
+                {
                     preparing = true;
                     std::string detail;
-                    std::wstring perr;
-                    const bool prepared = GamePrepare(id, target, package + L"\\Engines\\" + id, perr, detail);
-                    UsbLog(L"prepare " + id + L": " + (prepared ? L"done" : perr) + L"\n" + FromUtf8(detail));
+                    std::wstring perr, engine;
+                    const bool prepared = GamePrepareAny(id, target, package + L"\\Engines", engine, perr, detail);
+                    UsbLog(L"prepare " + id + L" (engine " + engine + L"): " + (prepared ? L"done" : perr) + L"\n" + FromUtf8(detail));
                     convertPrepared = prepared;
                     std::lock_guard<std::mutex> lock(copyLock);
                     prepareResult = prepared ? L"It's prepared: mount it (Y) or copy it to the Xbox (A)." : L"It couldn't be prepared: " + perr;
-                } else {
-                    std::lock_guard<std::mutex> lock(copyLock);
-                    prepareResult = L"XStation can't prepare this game on the console yet.";
                 }
                 const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
                 UsbLog(L"convert done: " + std::to_wstring(convertProgress.files.load()) + L" files, " + std::to_wstring(convertProgress.total.load()) +
@@ -2606,8 +2719,8 @@ struct DashApp : ApplicationT<DashApp> {
         // 2026-11-14: The Last of Us needs its reduced home textures and shader packs (made at prepare time); a game
         // prepared before that, or whose files were replaced, gets them here once, then starts.
         // Uncharted likewise: its 25 texture dictionaries trimmed (several minutes, once).
-        const bool tlouAssets = g.id == L"CUSA00552" && TlouAssetsNeeded(g.folder);
-        const bool ucAssets = g.id == L"CUSA02343" && UnchartedAssetsNeeded(g.folder);
+        const bool tlouAssets = GameEngineId(g.id) == L"CUSA00552" && TlouAssetsNeeded(g.folder);
+        const bool ucAssets = GameEngineId(g.id) == L"CUSA02343" && UnchartedAssetsNeeded(g.folder);
         if (tlouAssets || ucAssets) {
             launching = true;
             notice.Text(tlouAssets ? L"Getting The Last of Us ready: smaller home textures and shader packs from your game files. This takes a few minutes, once."
@@ -2881,7 +2994,7 @@ struct DashApp : ApplicationT<DashApp> {
         }).detach();
     }
 
-    // Check the newest release of the public
+    // XStation 2026-11-17: the newest release of the public
     // repo BBCPrince/XStation-UWP. Its tag v<major>.<minor>.<build>.<revision> is compared with this package; when
     // newer, its notes are shown once a day until the user opens the page. Any failure (offline, no release) shows nothing.
     static bool ParseVersion(const std::wstring& text, uint64_t& out) {
@@ -3021,11 +3134,12 @@ struct DashApp : ApplicationT<DashApp> {
             return;
         }
         if (detailsOpen) { detailsOpen = false; Refresh(false); return; }
-        if (tab == 1) { tab = 0; Refresh(); }
+        if (tab != 0) { tab = 0; Refresh(); }
     }
 
     void SwitchTab(int to) {
-        if (detailsOpen || tab == to) return;
+        to = std::clamp(to, 0, 2); // Games, Add Game, Compatible (2026-11-18)
+        if (detailsOpen || confirmOpen || tab == to) return;
         tab = to;
         Refresh();
     }
@@ -3088,10 +3202,10 @@ struct DashApp : ApplicationT<DashApp> {
                 const std::wstring id = t.convertedId, target = t.convertedTarget;
                 std::thread([this, keep = get_strong(), id, target] {
                     std::wstring message;
-                    if (GamePrepareSupported(id)) {
+                    if (true) { // 2026-11-17: any game is checked against every engine (other regions)
                         std::string detail;
-                        std::wstring perr;
-                        const bool prepared = GamePrepare(id, target, package + L"\\Engines\\" + id, perr, detail);
+                        std::wstring perr, engine;
+                        const bool prepared = GamePrepareAny(id, target, package + L"\\Engines", engine, perr, detail);
                         UsbLog(L"wifi prepare " + id + L": " + (prepared ? L"done" : perr) + L"\n" + FromUtf8(detail));
                         message = prepared ? id + L" is converted and ready to play." : id + L" is converted, but it couldn't be prepared: " + perr;
                     } else message = id + L" is converted. XStation can't prepare this game on the console yet.";
@@ -3171,8 +3285,8 @@ struct DashApp : ApplicationT<DashApp> {
         if (tab == 0 && on(GamepadButtons::Menu)) ToggleCpu();
         if (on(GamepadButtons::B)) Back();
         if (on(GamepadButtons::Y)) { if (tab == 1) MountSelected(); else Details(); }
-        if (on(GamepadButtons::LeftShoulder)) SwitchTab(0);
-        if (on(GamepadButtons::RightShoulder)) SwitchTab(1);
+        if (on(GamepadButtons::LeftShoulder)) SwitchTab(tab - 1);
+        if (on(GamepadButtons::RightShoulder)) SwitchTab(tab + 1);
         const int direction = (buttons & left) ? -1 : (buttons & right) ? 1 : 0;
         const auto time = std::chrono::steady_clock::now();
         if (direction != repeatDirection) {
@@ -3225,6 +3339,9 @@ struct DashApp : ApplicationT<DashApp> {
         }
         // Developer switch for testing Wi-Fi without a controller; absent on a normal install.
         if (Exists(dataRoot + L"\\dev-open-add-page.txt")) tab = 1;
+#ifndef XSTATION_PUBLIC
+        if (Exists(dataRoot + L"\\dev-open-compat-page.txt")) tab = 2; // 2026-11-18: a screenshot of the Compatible tab
+#endif
         // Developer switch (2026-11-15): dev-open-details.txt opens Details on the first game (a screenshot of the panel
         // without key presses); a line "status" also shows a sample save status. Absent on a normal install.
         {
@@ -3335,8 +3452,8 @@ struct DashApp : ApplicationT<DashApp> {
             case VK::I: if (confirmOpen && confirmKind == 4) NextImport(); else AskImport(); break;
             case VK::Escape: Back(); break;
             case VK::Y: if (tab == 1) MountSelected(); else Details(); break;
-            case VK::Q: SwitchTab(0); break;
-            case VK::E: SwitchTab(1); break;
+            case VK::Q: SwitchTab(tab - 1); break;
+            case VK::E: SwitchTab(tab + 1); break;
             default: break;
             }
         });
@@ -3359,6 +3476,7 @@ void RunXStationDashboard(const std::wstring& localRoot, const std::wstring& pac
         auto app = make_self<DashApp>();
         app->local = localRoot;
         app->package = packageRoot;
+        GameEnginesConfigure(localRoot); // 2026-11-17: other regions' engine choices
         app.detach();
     });
 }

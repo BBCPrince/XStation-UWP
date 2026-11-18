@@ -28,6 +28,15 @@ struct PkgParams {
 };
 bool PkgReadParams(const std::wstring& pkg, PkgParams& params, std::wstring& error);
 
+// 2026-11-18: the one message every
+// convert / copy / Wi-Fi path shows when the game doesn't fit:
+// "Not enough storage. This game needs 59.6 GB of free space on the Xbox, and it has 20.3 GB free.
+//  Free up at least 39.3 GB (delete games or files you don't need) and try again."
+// `need` and `freeBytes` in bytes; `where` names the drive ("the Xbox", "the USB drive"); `lead` replaces the first
+// sentence when the case needs it.
+std::wstring NotEnoughStorageText(uint64_t need, uint64_t freeBytes, const std::wstring& where = L"the Xbox",
+                                  const std::wstring& lead = L"Not enough storage.");
+
 // Reads the header (no decryption). False with `error` set when it isn't a PS4 PKG.
 bool PkgReadInfo(const std::wstring& pkg, PkgInfo& info, std::wstring& error);
 

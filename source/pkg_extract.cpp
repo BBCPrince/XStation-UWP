@@ -941,6 +941,16 @@ bool ParseSfo(const std::vector<uint8_t>& sfo, PkgParams& out) {
 
 } // namespace
 
+std::wstring NotEnoughStorageText(uint64_t need, uint64_t freeBytes, const std::wstring& where, const std::wstring& lead) {
+    // Tenths of a GB: what is needed rounded up, what is free rounded down, so the numbers never say it would fit.
+    const uint64_t tenth = 107374182; // 0.1 GiB
+    const uint64_t needT = (need + tenth - 1) / tenth, freeT = freeBytes / tenth;
+    const uint64_t moreT = needT > freeT ? needT - freeT : 1;
+    auto gb = [](uint64_t t) { wchar_t text[32]; swprintf_s(text, L"%llu.%llu GB", t / 10, t % 10); return std::wstring(text); };
+    return lead + L" This game needs " + gb(needT) + L" of free space on " + where + L", and it has " + gb(freeT) +
+           L" free.\nFree up at least " + gb(moreT) + L" (delete games or files you don't need) and try again.";
+}
+
 bool PkgReadInfo(const std::wstring& path, PkgInfo& info, std::wstring& error) {
     Pkg pkg;
     if (!pkg.OpenHeader(path, error)) return false;
@@ -1110,18 +1120,14 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
     for (auto& pkg : pkgs) pkg->file.log = nullptr;
 
     const bool shrinking = forced || (!normalFits && mayShrink);
+    // 2026-11-18: the drive by its letter, as the dashboard shows it ("D: 39.1 GB free of 136 GB").
+    const std::wstring where = outDir.size() > 1 && outDir[1] == L':' ? L"drive " + outDir.substr(0, 2) : L"the drive";
     if (!normalFits && !shrinking) {
-        wchar_t text[200];
-        swprintf_s(text, L"Not enough space on the drive: the game needs %.1f GB, and %.1f GB is free. Free up space (you can delete the PKG once the game is converted) and try again.",
-                   normalNeed / 1073741824.0, freeBytes / 1073741824.0);
-        error = text;
+        error = NotEnoughStorageText(normalNeed, freeBytes, where);
         return false;
     }
     if (shrinking && freeBytes && shrinkNeed > freeBytes) {
-        wchar_t text[240];
-        swprintf_s(text, L"Not enough space on the drive, even using the PKG up: it needs %.1f GB free, and %.1f GB is free.",
-                   shrinkNeed / 1073741824.0, freeBytes / 1073741824.0);
-        error = text;
+        error = NotEnoughStorageText(shrinkNeed, freeBytes, where, L"Not enough storage, even using the PKG up.");
         return false;
     }
     if (progress) { progress->total = total; progress->filesTotal = (uint32_t)plan.size(); }
@@ -1716,9 +1722,7 @@ struct PkgStream::Impl {
         }
         const uint64_t space = freeBytes ? freeBytes() : 0;
         if (space && needed + (1ull << 30) > space) {
-            wchar_t text[200];
-            swprintf_s(text, L"Not enough space: the game needs %.1f GB, and %.1f GB is free.", (needed + (1ull << 30)) / 1073741824.0, space / 1073741824.0);
-            Fail(text);
+            Fail(NotEnoughStorageText(needed + (1ull << 30), space, L"the Xbox"));
             return;
         }
         CreateDirectoryFromAppW(target.c_str(), nullptr);

@@ -69,6 +69,7 @@
 #include "dashboard.h"
 #include "usb_files.h"
 #include "tlou_assets.h"
+#include "game_prepare.h"
 #include <map>
 #include <ctime>
 #include <vector>
@@ -1344,7 +1345,12 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
         { std::wofstream last(root+L"\\last-game.txt",std::ios::trunc); last<<titleId; }
         CreateDirectoryW((localPath+L"\\tlou-bb194-user").c_str(),nullptr);
         CloseEarlierProcesses(root);
-        enginePath=L"Engines\\"+titleId;
+        // 2026-11-17 (other regions): a game prepared with another title's engine (its image matched) runs with it;
+        // its saves and settings stay in Titles\<its own id>.
+        GameEnginesConfigure(root);
+        const std::wstring engineId=GameEngineId(titleId);
+        enginePath=L"Engines\\"+engineId;
+        if(engineId!=titleId) Log("engine_alias="+to_string(engineId));
         bbEngine=GetFileAttributesW((installed+L"\\"+enginePath+L"\\bb-uwp-runtime.dll").c_str())!=INVALID_FILE_ATTRIBUTES;
         const std::wstring bootName=BootFolderName();
         gameFolder=installed+L"\\Games\\"+titleId;
@@ -1397,7 +1403,7 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
         }
         // 2026-11-14: Uncharted's runtime mip-skip only on untrimmed dictionaries (both at once would be blurrier); a
         // bb-env.txt BB_TEXTURE_MIP_SKIP line still wins.
-        if(titleId==L"CUSA02343"){
+        if(engineId==L"CUSA02343"){
             const bool trimmed=UnchartedTrimmed(gameFolder);
             _putenv_s("BB_TEXTURE_MIP_SKIP",trimmed?"0":"1");
             SetEnvironmentVariableW(L"BB_TEXTURE_MIP_SKIP",trimmed?L"0":L"1");

@@ -1,6 +1,6 @@
 # Game compatibility and performance
 
-Last reviewed: **2026-11-15**. These are recorded **Xbox Series X Developer Mode** results, not general emulator compatibility claims. Series S has not been verified. No complete campaign has been verified for any title.
+Last reviewed: **2026-11-18**. These are recorded **Xbox Series X Developer Mode** results, not general emulator compatibility claims. Series S has not been verified. No complete campaign has been verified for any title.
 
 **Build scope:** gameplay results below come from earlier installed development binaries. The source rebuild documented in [BUILD-VALIDATION.json](BUILD-VALIDATION.json) passed build/package checks, but has **not** been gameplay-tested. Rebuilding this repository does not guarantee the same results. God of War and Detroit's later development tests also differ from their packaged engine snapshots.
 
@@ -16,7 +16,7 @@ FPS describes the specified scene and settings. Loading, first-time shader compi
 | **God of War (2018)** — `CUSA07408` | **1.35** | In-game in earlier standalone development tests; below target performance | **16–17.7** in the later standalone test | Opening gameplay, including the Leviathan Axe swing prompt | This later performance trial was **not integrated into XStation's packaged engine**. Earlier memory/startup failures and slowdowns occurred; sustained 30 FPS and later progress unverified. |
 | **Detroit: Become Human** — `CUSA08344` | **1.00** (base game) | In-game in development tests; limited first-chapter route | **27.9–28.3 average** on the tested walk; **29–30** in lighter stretches, slower in heavier sections | Chapter 1, **The Hostage** tutorial/hallway route; intro also reached | Later tuned runtime differs from the packaged snapshot. Streaming/shader hitches remain; Audio3d is implemented as a silent sink, so audio support is incomplete. Later chapters unverified. |
 
-Use these game versions with the listed title IDs. Other updates and regions are unverified; a different executable can fail the preparation/version check. Bloodborne needs the **1.09 update applied to the game executable**; base-game metadata alone does not confirm that the update is present. These numbers describe the PS4 game version, separate from the XStation app/package version. No additional gameplay testing was performed for this documentation update.
+Use these game versions with the listed title IDs. Other updates and regions are unverified; a different executable can fail the preparation/version check. Bloodborne needs the **1.09 update applied to the game executable**; base-game metadata alone does not confirm that the update is present. These numbers describe the PS4 game version, separate from the XStation app/package version. Version 0.1.4.1 can accept another title ID after its prepared image exactly matches an existing engine; the gameplay measurements here remain specific to the listed title IDs. No additional gameplay testing was performed for this documentation update.
 
 ## Not verified
 
