@@ -50,6 +50,7 @@
 #include <winrt/Windows.Web.Http.h>
 #include <winrt/Windows.Web.Http.Headers.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Security.ExchangeActiveSyncProvisioning.h>
 #include <fileapifromapp.h>
 
 using namespace winrt;
@@ -85,9 +86,6 @@ const Tested kTested[] = {
     {L"CUSA02299", L"No gameplay yet", L"Crashes early"},
 };
 
-// 2026-11-18: the Compatible tab.
-// One row per engine the package has, with the exact copy that engine was made from. Other regions' copies work when
-// their game code is the same (GamePrepareAny checks it when the game is added).
 struct Compatible { const wchar_t* id; const wchar_t* name; const wchar_t* version; const wchar_t* region; };
 const Compatible kCompatible[] = {
     {L"CUSA02343", L"Uncharted: The Nathan Drake Collection", L"1.00, no update", L"Europe"},
@@ -97,7 +95,14 @@ const Compatible kCompatible[] = {
     {L"CUSA07408", L"God of War", L"1.35 (game + update 1.35)", L"US"},
 };
 
-// Games with no 30/60 FPS choice (the user's decision, 2026-11-07): God of War, Spider-Man.
+const wchar_t* kSetAsGame = L"XStation is set as an App, so the Xbox gives it only 1 GB of memory and games can't start. "
+    L"Set it to Game: in Dev Home, highlight XStation, press the View button, choose App details, change the type to Game, "
+    L"then start XStation again.";
+bool RunsAsApp() {
+    return Windows::System::Profile::AnalyticsInfo::VersionInfo().DeviceFamily() == L"Windows.Xbox" &&
+           Windows::System::MemoryManager::AppMemoryUsageLimit() < (2ull << 30);
+}
+
 bool HasFpsChoice(const std::wstring& title) { const auto id = GameEngineId(title); return id != L"CUSA07408" && id != L"CUSA02299"; }
 // Games whose 60 is FSR frame generation (the engine has their camera hookup), 30 by default (2026-11-09).
 bool HasFsrChoice(const std::wstring& title) { return GameEngineId(title) == L"CUSA00552"; }
@@ -128,7 +133,22 @@ struct UsbItem {
     std::string category; // PKGs: "gd" game, "gp" update (param.sfo CATEGORY)
     std::wstring version;
     BitmapImage art{nullptr}; // icon0.png of the folder or the PKG
+    // 2026-11-18: a game PKG whose engine plays it with an update, and that update's PKG on the same drive: one row,
+    // A converts both (the update's own row is left out of the list).
+    std::wstring updatePath, updateVersion;
+    uint64_t updateBytes{};
+    bool paired{};
+    // 2026-11-18: the compatibility check from the PKG's own game files, before any convert: -2 not checked yet, -1 it
+    // couldn't be checked (compatNote says why), 0 not compatible, 1 compatible (compatNote: the engine's game).
+    int compat = -2;
+    std::wstring compatNote;
 };
+std::wstring CompatKey(const UsbItem& u) { return u.path + L"|" + std::to_wstring(u.bytes) + L"|" + u.updatePath + L"|" + std::to_wstring(u.updateBytes); }
+// "01.09" -> "1.09" for the player.
+std::wstring VersionText(std::wstring v) {
+    while (v.size() > 1 && v[0] == L'0' && v[1] != L'.') v.erase(0, 1);
+    return v;
+}
 
 struct Mount {
     std::wstring id, folder, title;
@@ -222,6 +242,17 @@ void DeleteTreeFromApp(const std::wstring& path) {
         FindClose(h);
     }
     RemoveDirectoryFromAppW(path.c_str());
+}
+int CheckPkgsCompatible(const std::vector<std::wstring>& pkgs, const std::wstring& titleId, const std::wstring& scratch,
+                        const std::wstring& enginesRoot, std::wstring& engine, std::wstring& error, std::string& detail) {
+    DeleteTreeFromApp(scratch);
+    CreateDirectoryFromAppW(scratch.c_str(), nullptr);
+    static const std::vector<std::string> only{"eboot.bin", "sce_module/", "sce_sys/param.sfo"};
+    int result = -1;
+    if (PkgExtractGame(pkgs, scratch, nullptr, nullptr, false, error, 0, nullptr, false, &only))
+        result = GameMatchData(titleId, scratch, enginesRoot, engine, detail) ? 1 : 0;
+    DeleteTreeFromApp(scratch);
+    return result;
 }
 // A game's save folder: Bloodborne's engine keeps saves in game-user, the others in tlou-bb194-user.
 std::wstring SaveFolder(const std::wstring& local, const std::wstring& id) {
@@ -441,9 +472,11 @@ struct DashApp : ApplicationT<DashApp> {
     std::atomic<bool> deleting{false}, deleteFinished{false};
     std::atomic<uint64_t> deletedFiles{0}, deleteFailures{0};
     std::wstring deletingTitle;
-    bool devPlay = false, devDelete = false;
+    bool devPlay = false, devDelete = false, devLogs = false;
     int devWait = 0;
     std::vector<UsbItem> usb;
+    std::map<std::wstring, std::pair<int, std::wstring>> compatCache; // CompatKey -> (compat, compatNote); UI thread only
+    std::atomic<bool> compatRunning{false};
     size_t usbSelected = 0;
     bool usbScanning = false, usbScannedOnce = false, usbProbeWanted = false;
     std::wstring devUsbAction; // dev switch: "copy <id|pkg>" or "mount <id>" after the first scan
@@ -723,6 +756,7 @@ struct DashApp : ApplicationT<DashApp> {
         OptionRow(options, ButtonChip(L"☰", Color{255, 70, 78, 92}), L"CPU counter (FPS and CPU use, top right)", &dCpu);
         OptionRow(options, ButtonChip(L"VIEW", Color{255, 70, 78, 92}), L"Export saves to the USB drive", nullptr);
         OptionRow(options, ButtonChip(L"X", Color{255, 40, 90, 170}), L"Import saves from the USB drive", nullptr);
+        OptionRow(options, ButtonChip(L"RS", Color{255, 70, 78, 92}), L"Copy logs to the USB drive (click the right stick; for bug reports)", nullptr);
         detailsView.Children().Append(options);
         dStatusBox = Border();
         dStatusBox.CornerRadius(CornerRadius{6, 6, 6, 6});
@@ -1052,7 +1086,7 @@ struct DashApp : ApplicationT<DashApp> {
             wifiStatusText.TextWrapping(TextWrapping::Wrap);
             wifiStatusText.TextTrimming(TextTrimming::None);
             stack.Children().Append(wifiStatusText);
-            auto help = Text(L"Send a game folder made on your PC by xstation_import.py. It shows up in Games when it's done.", 12, White(140));
+            auto help = Text(L"Send a game's PKG (the Xbox converts it as it arrives) or a prepared game folder. It shows up in Games when it's done.", 12, White(140));
             help.TextWrapping(TextWrapping::Wrap);
             help.TextTrimming(TextTrimming::None);
             help.Margin(Thickness{0, 12, 0, 0});
@@ -1638,7 +1672,7 @@ struct DashApp : ApplicationT<DashApp> {
         if (!g.hasEngine) { status = L"No engine"; statusSub = L"This game can't start yet"; }
         else if (g.usbMissing) { status = L"USB drive missing"; statusSub = L"Plug it in to play"; }
         else if (copyingThis) { status = L"Copying"; statusSub = L"Wait for the copy to finish"; }
-        else if (!g.hasBoot) { status = L"Not prepared"; statusSub = L"Run the PC import tool"; }
+        else if (!g.hasBoot) { status = L"Not prepared"; statusSub = L"Delete it and add its PKG again"; }
         else if (g.mounted) statusSub = L"Plays from the USB drive";
         SetCards(FormatHours(g.seconds), FormatAgo(g.lastPlayed), speed, speed == L"Not tested" ? L"No results recorded" : L"Tested on Xbox Series X", status, statusSub,
                  FormatBytes(g.bytes), g.id + (g.version.empty() ? L"" : L"  ·  v" + g.version));
@@ -1676,6 +1710,7 @@ struct DashApp : ApplicationT<DashApp> {
         if (wifiStarted) return;
         wifiStarted = true;
         constexpr int port = 8765;
+        SetTransferEngines(package + L"\\Engines");
         if (!StartTransferServer(dataRoot, pairing, port)) {
             wifiAddressText.Text(L"Wi-Fi isn't available");
             wifiCodeText.Text(L"—");
@@ -1708,6 +1743,9 @@ struct DashApp : ApplicationT<DashApp> {
 
     std::wstring UsbLabel(const UsbItem& item) {
         if (item.pkg) {
+            if (!item.updatePath.empty())
+                return L"PKG:  " + item.title + L"   (" + item.id + L")   game + update " + VersionText(item.updateVersion) + L"   " +
+                       FormatBytes(item.bytes + item.updateBytes) + L"   A converts both";
             const std::wstring kind = item.category == "gp" ? L"update" : item.category == "gd" ? L"game" : L"PKG";
             return L"PKG:  " + item.title + (item.id.empty() ? L"" : L"   (" + item.id + L")") + L"   " + kind +
                    (item.version.empty() ? L"" : L" " + item.version) + L"   " + FormatBytes(item.bytes) + L"   A converts it";
@@ -1780,6 +1818,35 @@ struct DashApp : ApplicationT<DashApp> {
             chip = item.category == "gp" ? L"Update " + item.version : item.category == "gd" ? L"Game " + item.version : L"PKG";
             chipColor = item.category.empty() ? Color{255, 95, 94, 90} : Color{255, 59, 109, 17};
             sub = L"PKG \u00B7 " + FormatBytes(item.bytes) + (item.category == "gp" ? L" \u00B7 with the game PKG on this drive" : L"");
+            const std::wstring needed = item.id.empty() ? L"" : GameNeededUpdate(item.id);
+            if (!item.updatePath.empty()) {
+                chip = L"Game + update " + VersionText(item.updateVersion);
+                sub = L"2 PKGs \u00B7 " + FormatBytes(item.bytes + item.updateBytes) +
+                      (item.updateVersion == needed ? L" \u00B7 A converts both" : L" \u00B7 needs update " + VersionText(needed) + L", not this one");
+            } else if (item.category == "gd" && !needed.empty() && item.version != needed) {
+                sub += L" \u00B7 needs its update " + VersionText(needed) + L" PKG on this drive too";
+            } else if (item.category == "gp" && needed.empty() && GamePrepareSupported(GameEngineId(item.id))) {
+                sub = L"PKG \u00B7 " + FormatBytes(item.bytes) + L" \u00B7 not needed: XStation plays this game with no update";
+            }
+            // 2026-11-18: the check from the game files (StartCompatChecks), shown before anything is converted.
+            if (item.category == "gd") {
+                if (item.compat == 1) {
+                    chipColor = Color{255, 15, 110, 86};
+                    sub = (item.updatePath.empty() ? L"PKG \u00B7 " + FormatBytes(item.bytes) : L"2 PKGs \u00B7 " + FormatBytes(item.bytes + item.updateBytes)) +
+                          L" \u00B7 Compatible" + (item.compatNote.empty() ? L"" : L" (" + item.compatNote + L")") +
+                          (item.updatePath.empty() ? L" \u00B7 A converts it" : L" \u00B7 A converts both");
+                } else if (item.compat == 0) {
+                    chip = L"Not compatible";
+                    chipColor = Color{255, 150, 40, 40};
+                    sub = L"PKG \u00B7 " + FormatBytes(item.bytes + item.updateBytes) + L" \u00B7 not a version or region XStation can play";
+                } else if (item.compat == -1) {
+                    chip = L"Can't check";
+                    chipColor = Color{255, 133, 79, 11};
+                    sub = L"PKG \u00B7 " + FormatBytes(item.bytes + item.updateBytes) + L" \u00B7 " + item.compatNote;
+                } else if (needed.empty() || !item.updatePath.empty() || item.version == needed) {
+                    sub += L" \u00B7 checking if it's compatible\u2026";
+                }
+            }
             if (item.id.empty()) sub = L"PKG \u00B7 " + FormatBytes(item.bytes) + L" \u00B7 XStation can't read it";
         } else if (!item.prepared) {
             chip = L"Not prepared";
@@ -2081,6 +2148,30 @@ struct DashApp : ApplicationT<DashApp> {
                     usb.push_back(item);
                 }
             }
+            for (size_t g = 0; g < usb.size(); ++g) {
+                if (!usb[g].pkg || usb[g].category != "gd" || usb[g].id.empty()) continue;
+                const std::wstring needed = GameNeededUpdate(usb[g].id);
+                if (needed.empty()) continue;
+                size_t best = usb.size();
+                for (size_t i = 0; i < usb.size(); ++i) {
+                    const UsbItem& u = usb[i];
+                    if (!u.pkg || u.category != "gp" || u.id != usb[g].id || u.paired) continue;
+                    if (best == usb.size()) { best = i; continue; }
+                    const bool bestExact = usb[best].version == needed;
+                    if (!bestExact && (u.version == needed || u.version > usb[best].version)) best = i;
+                }
+                if (best == usb.size()) continue;
+                usb[g].updatePath = usb[best].path;
+                usb[g].updateVersion = usb[best].version;
+                usb[g].updateBytes = usb[best].bytes;
+                usb[best].paired = true;
+            }
+            usb.erase(std::remove_if(usb.begin(), usb.end(), [](const UsbItem& u) { return u.paired; }), usb.end());
+            for (auto& u : usb) {
+                if (auto c = compatCache.find(CompatKey(u)); c != compatCache.end()) { u.compat = c->second.first; u.compatNote = c->second.second; }
+            }
+            StartCompatChecks();
+            if (usbSelected >= usb.size()) usbSelected = usb.empty() ? 0 : usb.size() - 1;
             usbStatus = drives.Size() == 0 ? L"No USB drive found. Plug one in, then press X." : L"";
         } catch (hresult_error const& e) {
             usbStatus = L"USB access failed: " + std::wstring(e.message().c_str());
@@ -2108,7 +2199,7 @@ struct DashApp : ApplicationT<DashApp> {
     void MountSelected() {
         if (usbScanning || usbSelected >= usb.size()) return;
         const UsbItem item = usb[usbSelected];
-        if (item.pkg) { usbStatus = L"A PKG can't be mounted. Convert it on your PC with xstation_import.py, then put the game folder it makes into XStation on the drive."; RefreshUsb(); return; }
+        if (item.pkg) { usbStatus = L"A PKG can't be mounted. Press A to convert it into a game folder on the drive, then mount that."; RefreshUsb(); return; }
         auto mounts = ReadMounts();
         const auto it = std::find_if(mounts.begin(), mounts.end(), [&](const Mount& m) { return m.id == item.id; });
         if (it != mounts.end() && it->folder == item.path) {
@@ -2117,7 +2208,7 @@ struct DashApp : ApplicationT<DashApp> {
             usbStatus = L"Unmounted " + item.title + L". It's still on the USB drive.";
             UsbLog(L"unmount " + item.id);
         } else {
-            if (!item.prepared) { usbStatus = item.title + L" has no prepared image (GameBoot). Make the folder with xstation_import.py on your PC."; RefreshUsb(); return; }
+            if (!item.prepared) { usbStatus = item.title + L" isn't prepared yet. Press A to prepare it."; RefreshUsb(); return; }
             for (const auto& g : games) {
                 if (g.id == item.id && !g.mounted) { usbStatus = item.title + L" is already on this Xbox. Play that copy, or delete it first to play from the USB drive."; RefreshUsb(); return; }
             }
@@ -2323,16 +2414,109 @@ struct DashApp : ApplicationT<DashApp> {
             copyState = ok ? 3 : 4;
         }).detach();
     }
+    // 2026-11-18: game PKGs on the drive (with their update when paired) are checked one by one in the background right after
+    // a scan; each row shows the result, and A converts only a compatible one. Results are kept per file and size.
+    // An update on its own, or a game whose engine needs an update that isn't on the drive, isn't checked (its row says why).
+    void StartCompatChecks() {
+        if (compatRunning) return;
+        struct Job { std::wstring key, id; std::vector<std::wstring> pkgs; };
+        std::vector<Job> jobs;
+        for (const auto& u : usb) {
+            if (!u.pkg || u.id.empty() || u.category != "gd" || u.compat != -2) continue;
+            if (!GameNeededUpdate(u.id).empty() && u.updatePath.empty() && u.version != GameNeededUpdate(u.id)) continue;
+            Job j{CompatKey(u), u.id, {u.path}};
+            if (!u.updatePath.empty()) j.pkgs.push_back(u.updatePath);
+            jobs.push_back(j);
+        }
+        if (jobs.empty()) return;
+        compatRunning = true;
+        const auto dispatcher = Window::Current().Dispatcher();
+        std::thread([this, keep = get_strong(), dispatcher, jobs] {
+            for (const auto& j : jobs) {
+                std::wstring engine, error;
+                std::string detail;
+                const auto began = std::chrono::steady_clock::now();
+                const int result = CheckPkgsCompatible(j.pkgs, j.id, local + L"\\compat-check", package + L"\\Engines", engine, error, detail);
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+                std::wstring note;
+                if (result == 1) {
+                    note = engine;
+                    for (const auto& c : kCompatible) if (engine == c.id) note = c.name;
+                } else if (result == -1) {
+                    note = error;
+                }
+                UsbLog(L"compat check " + j.id + L": " + (result == 1 ? L"compatible (" + engine + L")" : result == 0 ? std::wstring(L"not compatible") : L"couldn't check: " + error) +
+                       L" in " + std::to_wstring((int)s) + L" s\n" + FromUtf8(detail));
+                dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [this, keep, key = j.key, result, note] {
+                    compatCache[key] = {result, note};
+                    for (auto& u : usb) if (CompatKey(u) == key) { u.compat = result; u.compatNote = note; }
+                    if (tab == 1 && !usbScanning) RefreshUsb();
+                });
+            }
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [this, keep] {
+                compatRunning = false;
+                StartCompatChecks(); // rows a rescan added meanwhile
+            });
+        }).detach();
+    }
+
     void ConvertUsbSelected(bool useUp = false) {
         const UsbItem item = usb[usbSelected];
         if (item.id.empty()) { usbStatus = L"XStation can't read this PKG: " + item.name; RefreshUsb(); return; }
         for (const wchar_t c : item.id) if (!iswalnum(c)) { usbStatus = L"This PKG's title ID isn't usable."; RefreshUsb(); return; }
         std::vector<std::wstring> pkgs;
-        if (item.category == "gp") {
+        // 2026-11-18: the engine's exact copy decides which PKGs make a game that plays (GameNeededUpdate).
+        const std::wstring needed = GameNeededUpdate(item.id);
+        if (item.category == "gd" && !needed.empty() && item.version != needed) { // (a game PKG with the update built in needs none)
+            if (item.updatePath.empty()) {
+                usbStatus = item.title + L" plays with its update " + VersionText(needed) +
+                            L". Put the update PKG on the drive next to the game PKG and press X to look again: then A converts both together.";
+                RefreshUsb();
+                return;
+            }
+            if (item.updateVersion != needed) {
+                usbStatus = L"The update on the drive is " + VersionText(item.updateVersion) + L", but " + item.title + L" needs update " +
+                            VersionText(needed) + L". Put that update's PKG on the drive instead.";
+                RefreshUsb();
+                return;
+            }
+        }
+        if (item.category == "gp" && needed.empty() && GamePrepareSupported(GameEngineId(item.id))) {
+            usbStatus = L"XStation plays " + item.title + L" with no update, so this update isn't needed (it wouldn't play). Convert the game PKG on its own.";
+            RefreshUsb();
+            return;
+        }
+        if (item.category == "gp" && !needed.empty() && item.version != needed) {
+            usbStatus = L"This update is " + VersionText(item.version) + L", but " + item.title + L" needs update " + VersionText(needed) + L".";
+            RefreshUsb();
+            return;
+        }
+        // 2026-11-18: only a game the check found compatible is converted (no time spent on one that can't play).
+        if (item.category == "gd") {
+            if (item.compat == -2) {
+                usbStatus = L"Still checking whether this copy of " + item.title + L" works with XStation. Try again in a moment.";
+                RefreshUsb();
+                StartCompatChecks();
+                return;
+            }
+            if (item.compat == 0) {
+                usbStatus = L"Not compatible: this copy of " + item.title + L" isn't a version or region XStation can play, so it won't be "
+                            L"converted. The Compatible tab lists the copies that work.";
+                RefreshUsb();
+                return;
+            }
+            if (item.compat == -1) {
+                usbStatus = L"XStation couldn't check this PKG, so it won't be converted: " + item.compatNote;
+                RefreshUsb();
+                return;
+            }
+        }
+        if (!item.updatePath.empty()) pkgs = {item.path, item.updatePath};
+        else if (item.category == "gp") {
             for (const auto& other : usb) if (other.pkg && other.id == item.id && other.category == "gd") { pkgs.push_back(other.path); break; }
             if (pkgs.empty()) { usbStatus = L"This is an update. Put the game's own PKG on the drive too, then convert the update again."; RefreshUsb(); return; }
         }
-        pkgs.push_back(item.path);
+        if (item.updatePath.empty()) pkgs.push_back(item.path);
         const size_t slash = item.path.find(L'\\');
         const std::wstring root = slash == std::wstring::npos ? item.path : item.path.substr(0, slash);
         // Bloodborne's engine uses its 1.09 folder names (GameData109).
@@ -2356,7 +2540,8 @@ struct DashApp : ApplicationT<DashApp> {
         {
             std::lock_guard<std::mutex> lock(copyLock);
             copyError.clear();
-            copyTitle = item.title + (item.category == "gp" ? L" " + item.version : L"");
+            copyTitle = item.title + (!item.updatePath.empty() ? L" + update " + VersionText(item.updateVersion)
+                                      : item.category == "gp" ? L" " + item.version : L"");
             copyId.clear();
             copyTarget = target;
             copyArt = item.art;
@@ -2706,6 +2891,11 @@ struct DashApp : ApplicationT<DashApp> {
                L" copying " + std::to_wstring(g.copying) + L" boot " + std::to_wstring(g.hasBoot) + L" engine " + std::to_wstring(g.hasEngine) +
                L" copyState " + std::to_wstring(copyState.load()));
         if (CopyRunning()) { notice.Text(L"A game is copying from USB. Starting a game now would stop the copy, so wait for it to finish."); return; }
+        if (RunsAsApp()) {
+            notice.Text(kSetAsGame);
+            UsbLog(L"play refused: memory limit " + std::to_wstring(Windows::System::MemoryManager::AppMemoryUsageLimit() >> 20) + L" MiB (set as App)");
+            return;
+        }
         if (g.usbMissing || (g.mounted && !Exists(g.folder))) {
             notice.Text(L"Plug in the USB drive that has " + g.title + L".");
             WakeUsb();
@@ -2713,7 +2903,7 @@ struct DashApp : ApplicationT<DashApp> {
         }
         if (g.copying) { notice.Text(L"This game's copy didn't finish. Copy it again from the USB drive on the Add Game page."); return; }
         if (!g.hasBoot || !g.hasEngine) {
-            notice.Text(g.hasEngine ? L"This game isn't prepared yet. Run the PC import tool." : L"XStation has no engine for this game yet.");
+            notice.Text(g.hasEngine ? L"This game isn't prepared yet. Delete it, then add its PKG again on the Add Game page (USB or Wi-Fi): XStation converts and prepares it." : L"XStation has no engine for this game yet.");
             return;
         }
         // 2026-11-14: The Last of Us needs its reduced home textures and shader packs (made at prepare time); a game
@@ -2902,6 +3092,94 @@ struct DashApp : ApplicationT<DashApp> {
         }).detach();
     }
 
+    fire_and_forget ExportLogs() {
+        if (tab != 0 || !detailsOpen || confirmOpen || deleting || launching || savesBusy || games.empty()) co_return;
+        auto keep = get_strong();
+        const Game g = games[selected];
+        savesBusy = true;
+        notice.Text(L"Copying " + g.title + L" logs to the USB drive…");
+        std::wstring root;
+        try {
+            auto drives = co_await KnownFolders::RemovableDevices().GetFoldersAsync();
+            for (auto const& drive : drives) { root = drive.Path().c_str(); break; }
+        } catch (...) {}
+        while (!root.empty() && root.back() == L'\\') root.pop_back();
+        if (root.empty()) { savesBusy = false; UsbLog(L"log export " + g.id + L": no USB drive"); notice.Text(L"No USB drive found. Plug one in and try again."); co_return; }
+        std::string system;
+        {
+            const auto v = Windows::ApplicationModel::Package::Current().Id().Version();
+            const auto info = Windows::System::Profile::AnalyticsInfo::VersionInfo();
+            system += "XStation " + std::to_string(v.Major) + "." + std::to_string(v.Minor) + "." + std::to_string(v.Build) + "." +
+                      std::to_string(v.Revision) + "\r\n";
+            system += "device family " + ToUtf8(info.DeviceFamily().c_str()) + " " + ToUtf8(info.DeviceFamilyVersion().c_str()) + "\r\n";
+            try {
+                Windows::Security::ExchangeActiveSyncProvisioning::EasClientDeviceInformation device;
+                system += "console " + ToUtf8(device.SystemManufacturer().c_str()) + " " + ToUtf8(device.SystemProductName().c_str()) + " " +
+                          ToUtf8(device.SystemSku().c_str()) + "\r\n";
+            } catch (...) { system += "console unknown\r\n"; }
+            system += "dashboard memory limit MiB " + std::to_string(Windows::System::MemoryManager::AppMemoryUsageLimit() >> 20) + "\r\n";
+            ULARGE_INTEGER freeBytes{};
+            if (GetDiskFreeSpaceExW((dataRoot + L"\\").c_str(), &freeBytes, nullptr, nullptr))
+                system += "free on " + ToUtf8(dataRoot) + ": " + ToUtf8(FormatBytes(freeBytes.QuadPart)) + "\r\n";
+            system += "game " + ToUtf8(g.title) + " " + ToUtf8(g.id) + " engine " + ToUtf8(GameEngineId(g.id)) + "\r\n";
+        }
+        const auto dispatcher = Window::Current().Dispatcher();
+        std::thread([this, keep, dispatcher, g, root, system] {
+            const std::wstring logs = root + L"\\XStation\\Logs", game = logs + L"\\" + g.id, stamp = SaveStamp(), to = game + L"\\" + stamp;
+            CreateDirectoryFromAppW((root + L"\\XStation").c_str(), nullptr);
+            CreateDirectoryFromAppW(logs.c_str(), nullptr);
+            CreateDirectoryFromAppW(game.c_str(), nullptr);
+            uint64_t files = 0, bytes = 0;
+            std::string skipped;
+            std::wstring error;
+            bool ok = CreateDirectoryFromAppW(to.c_str(), nullptr) != 0;
+            if (!ok) error = L"make folder " + to + L" (error " + std::to_wstring(GetLastError()) + L")";
+            // Copies the log-type files directly in `from` (no subfolders) into to\<sub>.
+            auto copyLogs = [&](const std::wstring& from, const std::wstring& sub) {
+                WIN32_FIND_DATAW f;
+                HANDLE h = FindFirstFileExFromAppW((from + L"\\*").c_str(), FindExInfoBasic, &f, FindExSearchNameMatch, nullptr, 0);
+                if (h == INVALID_HANDLE_VALUE) return;
+                bool made = false;
+                do {
+                    const std::wstring name = f.cFileName;
+                    if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    const auto dot = name.rfind(L'.');
+                    std::wstring ext = dot == std::wstring::npos ? L"" : name.substr(dot);
+                    for (auto& c : ext) c = towlower(c);
+                    if (ext != L".log" && ext != L".txt" && ext != L".csv" && ext != L".ini") continue;
+                    const uint64_t size = (uint64_t(f.nFileSizeHigh) << 32) | f.nFileSizeLow;
+                    if (size > (64ull << 20)) { skipped += ToUtf8(sub + L"\\" + name) + " (too big, " + std::to_string(size >> 20) + " MiB)\r\n"; continue; }
+                    if (!made) { CreateDirectoryFromAppW((to + L"\\" + sub).c_str(), nullptr); made = true; }
+                    std::wstring step;
+                    if (CopyFileThroughApp(from + L"\\" + name, to + L"\\" + sub + L"\\" + name, bytes, step)) ++files;
+                    else skipped += ToUtf8(sub + L"\\" + name) + " (" + ToUtf8(step) + ")\r\n";
+                } while (FindNextFileW(h, &f));
+                FindClose(h);
+            };
+            if (ok) {
+                const std::wstring title = local + L"\\Titles\\" + g.id;
+                copyLogs(title, L"game");
+                for (const wchar_t* user : {L"game-user", L"tlou-bb194-user"}) copyLogs(title + L"\\" + user, std::wstring(L"game\\") + user);
+                copyLogs(dataRoot, L"xstation");
+                if (dataRoot != local) copyLogs(local, L"xstation-app");
+                std::ofstream info(to + L"\\system.txt", std::ios::trunc | std::ios::binary);
+                info << system << files << " log files, " << bytes << " bytes\r\n";
+                if (!skipped.empty()) info << "skipped:\r\n" << skipped;
+                ok = bool(info.flush());
+                if (!ok) error = L"write system.txt";
+            }
+            if (!ok) { DeleteTreeFromApp(to); RemoveDirectoryFromAppW(game.c_str()); }
+            UsbLog(L"log export " + g.id + L" -> " + to + (ok ? L" ok " : L" FAILED ") + std::to_wstring(files) + L" files" +
+                   (error.empty() ? L"" : L": " + error));
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [this, keep, g, stamp, files, bytes, ok, error] {
+                savesBusy = false;
+                SaveStatus(ok ? L"Copied " + std::to_wstring(files) + L" log files (" + FormatBytes(bytes) + L") to the USB drive: XStation\\Logs\\" +
+                                    g.id + L"\\" + stamp + L". Send that folder with your bug report."
+                              : L"Couldn't copy the logs to the USB drive: " + error + L".", ok);
+            });
+        }).detach();
+    }
+
     // X in Details: find this game's exports on the USB drive and ask which one to import (X again: the next older).
     fire_and_forget AskImport() {
         if (tab != 0 || !detailsOpen || confirmOpen || deleting || launching || savesBusy || games.empty()) co_return;
@@ -2994,9 +3272,6 @@ struct DashApp : ApplicationT<DashApp> {
         }).detach();
     }
 
-    // XStation 2026-11-17: the newest release of the public
-    // repo BBCPrince/XStation-UWP. Its tag v<major>.<minor>.<build>.<revision> is compared with this package; when
-    // newer, its notes are shown once a day until the user opens the page. Any failure (offline, no release) shows nothing.
     static bool ParseVersion(const std::wstring& text, uint64_t& out) {
         size_t at = 0;
         while (at < text.size() && !iswdigit(text[at])) ++at;
@@ -3251,7 +3526,8 @@ struct DashApp : ApplicationT<DashApp> {
                 notice.Text(L"Deleting " + deletingTitle + L"\u2026  " + std::to_wstring(deletedFiles.load()) + L" files");
             }
         }
-        if ((devPlay || devDelete) && devWait && !--devWait) {
+        if ((devPlay || devDelete || devLogs) && devWait && !--devWait) {
+            if (devLogs) { devLogs = false; tab = 0; detailsOpen = true; Refresh(); ExportLogs(); } // dev-export-logs.txt
             if (devPlay) { devPlay = false; tab = 0; Refresh(); Play(); }
             if (devDelete) { devDelete = false; AskDelete(); ConfirmDelete(); }
         }
@@ -3274,6 +3550,7 @@ struct DashApp : ApplicationT<DashApp> {
             else AskDelete();
         }
         if (on(GamepadButtons::View) && tab == 0 && detailsOpen) ExportSaves();
+        if (on(GamepadButtons::RightThumbstick) && tab == 0 && detailsOpen) ExportLogs();
         if (tab == 1 && !usb.empty() && !usbScanning && !confirmOpen) {
             if (on(GamepadButtons::DPadDown) && usbSelected + 1 < usb.size()) { ++usbSelected; RefreshUsb(); }
             if (on(GamepadButtons::DPadUp) && usbSelected) { --usbSelected; RefreshUsb(); }
@@ -3318,6 +3595,7 @@ struct DashApp : ApplicationT<DashApp> {
         CreateDirectoryW((dataRoot + L"\\Import").c_str(), nullptr);
         Build();
         if (gamesDriveMissing) notice.Text(L"XStation can't write to D:\\DevelopmentFiles, so it can't store games right now.");
+        if (RunsAsApp()) notice.Text(kSetAsGame);
         Rescan();
         ShowLastExit();
         if (MountMissing()) WakeUsb();
@@ -3328,7 +3606,9 @@ struct DashApp : ApplicationT<DashApp> {
 #ifndef XSTATION_PUBLIC // the dev-*.txt test switches, none in a public build
         // Developer switches for testing with no controller; absent on a normal install.
         const std::wstring devPlayFile = dataRoot + L"\\dev-autoplay.txt", devDeleteFile = dataRoot + L"\\dev-autodelete.txt";
-        for (const auto& [file, flag] : {std::pair<std::wstring, bool*>{devPlayFile, &devPlay}, std::pair<std::wstring, bool*>{devDeleteFile, &devDelete}}) {
+        const std::wstring devLogsFile = dataRoot + L"\\dev-export-logs.txt"; // 2026-11-18: <title id>: Details + copy its logs to USB
+        for (const auto& [file, flag] : {std::pair<std::wstring, bool*>{devPlayFile, &devPlay}, std::pair<std::wstring, bool*>{devDeleteFile, &devDelete},
+                                         std::pair<std::wstring, bool*>{devLogsFile, &devLogs}}) {
             std::wifstream dev(file);
             std::wstring wanted;
             if (dev >> wanted) {
@@ -3430,7 +3710,8 @@ struct DashApp : ApplicationT<DashApp> {
 #endif
         {
             std::ofstream log(dataRoot + L"\\xstation-wifi.log", std::ios::app);
-            log << "dashboard games=" << games.size() << " tab=" << tab << "\n";
+            log << "dashboard games=" << games.size() << " tab=" << tab << " memory_limit_MiB=" << (Windows::System::MemoryManager::AppMemoryUsageLimit() >> 20)
+                << " set_as_app=" << RunsAsApp() << "\n";
         }
         Refresh();
 
@@ -3449,6 +3730,7 @@ struct DashApp : ApplicationT<DashApp> {
             case VK::Delete: AskDelete(); break;
             case VK::C: ToggleCpu(); break;
             case VK::S: ExportSaves(); break;
+            case VK::L: ExportLogs(); break;
             case VK::I: if (confirmOpen && confirmKind == 4) NextImport(); else AskImport(); break;
             case VK::Escape: Back(); break;
             case VK::Y: if (tab == 1) MountSelected(); else Details(); break;

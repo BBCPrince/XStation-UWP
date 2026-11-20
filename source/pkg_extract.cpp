@@ -124,8 +124,24 @@ struct Range {
     uint64_t begin, end;
 };
 
+// 2026-11-19 (Wi-Fi check before a send): PKGs whose bytes come from elsewhere, by path (PkgRemoteAdd).
+struct Remote {
+    uint64_t size;
+    PkgRemoteRead read;
+};
+std::mutex g_remoteLock;
+std::map<std::wstring, Remote> g_remotes;
+bool FindRemote(const std::wstring& path, Remote& out) {
+    std::lock_guard<std::mutex> lock(g_remoteLock);
+    const auto it = g_remotes.find(path);
+    if (it == g_remotes.end()) return false;
+    out = it->second;
+    return true;
+}
+
 struct FileSource : Source {
     HANDLE h = INVALID_HANDLE_VALUE;
+    PkgRemoteRead remote; // set: a remote PKG (reads go through it, no file)
     uint64_t size = 0;
     uint64_t actual = 0;               // the file's real size (`size` can be its size before a shrinking convert cut it)
     std::vector<Range>* log = nullptr; // PkgLayoutReport / shrinking: every read, in order
@@ -134,6 +150,11 @@ struct FileSource : Source {
     bool Open(const std::wstring& path, bool write = false, uint64_t logicalSize = 0) {
         path_ = path;
         write_ = write;
+        if (Remote r; !write && FindRemote(path, r)) {
+            remote = r.read;
+            size = actual = r.size;
+            return true;
+        }
         if (!Reopen()) return false;
         actual = size;
         if (logicalSize > size) size = logicalSize;
@@ -169,6 +190,7 @@ struct FileSource : Source {
     ~FileSource() override { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
     bool Read(uint64_t offset, uint8_t* buf, size_t n) override {
         if (log) log->push_back({offset, offset + n});
+        if (remote) return offset + n <= size && remote(offset, buf, n);
         while (n) {
             OVERLAPPED at{};
             at.Offset = DWORD(offset);
@@ -951,6 +973,16 @@ std::wstring NotEnoughStorageText(uint64_t need, uint64_t freeBytes, const std::
            L" free.\nFree up at least " + gb(moreT) + L" (delete games or files you don't need) and try again.";
 }
 
+void PkgRemoteAdd(const std::wstring& path, uint64_t size, PkgRemoteRead read) {
+    std::lock_guard<std::mutex> lock(g_remoteLock);
+    g_remotes[path] = {size, std::move(read)};
+}
+
+void PkgRemoteRemove(const std::wstring& path) {
+    std::lock_guard<std::mutex> lock(g_remoteLock);
+    g_remotes.erase(path);
+}
+
 bool PkgReadInfo(const std::wstring& path, PkgInfo& info, std::wstring& error) {
     Pkg pkg;
     if (!pkg.OpenHeader(path, error)) return false;
@@ -982,7 +1014,7 @@ bool PkgReadParams(const std::wstring& path, PkgParams& out, std::wstring& error
 
 bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& outDir, PkgProgress* progress,
                     const std::atomic<bool>* cancel, bool resume, std::wstring& error, uint64_t freeBytes, PkgShrink* shrink,
-                    bool rewriteUpdates) {
+                    bool rewriteUpdates, const std::vector<std::string>* only) {
     if (!Alg().ok) { error = L"Windows' crypto functions couldn't be opened."; return false; }
     // A shrinking convert that already cut these PKGs left <game folder>\.xstation-shrink: "<size before>\t<file name>" lines.
     const std::wstring statePath = outDir.substr(0, outDir.find_last_of(L'\\')) + L"\\.xstation-shrink";
@@ -1035,6 +1067,16 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
             if (name.empty()) { char synthetic[32]; sprintf_s(synthetic, "entry_%04X.bin", e.id); name = synthetic; }
             items.push_back({k, true, i, e.size, "sce_sys/" + name});
         }
+    }
+    if (only) {
+        items.erase(std::remove_if(items.begin(), items.end(), [&](const Item& it) {
+            std::string p = it.path;
+            std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return (char)tolower(c); });
+            for (const auto& w : *only) {
+                if (p == w || (!w.empty() && w.back() == '/' && p.rfind(w, 0) == 0)) return false;
+            }
+            return true;
+        }), items.end());
     }
     std::map<std::string, Item> plan; // by lower-case path (Windows names), last one wins
     std::vector<std::string> order;

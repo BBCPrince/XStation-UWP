@@ -6,6 +6,10 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <memory>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -36,6 +40,8 @@ bool convertedUpdate = false;
 // 2026-11-14: why the last Wi-Fi PKG stopped (empty while one runs or after a good one). A refusal reaches the
 // browser while it is still sending, so it sees only "connection lost"; the page asks /pkgresult for the reason.
 std::wstring lastPkgError;
+// 2026-11-19: the Engines folder, for the compatibility check before a Wi-Fi send (SetTransferEngines).
+std::wstring enginesRoot;
 
 const char kPage[] = R"HTML(<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XStation transfer</title>
 <style>
@@ -47,8 +53,8 @@ input[type=file]{display:block;max-width:100%;margin-bottom:10px}button{font:600
 progress{width:100%;height:14px;margin-top:6px}#status{font-size:14px;word-break:break-word;min-height:42px;white-space:pre-line}
 </style><main><h1>XSTATION</h1>
 <section><label for="code">Pairing code shown on the Xbox</label><input id="code" type="text" inputmode="numeric" maxlength="6" autocomplete="off"></section>
-<section><h2>Prepared game folder</h2><p>Choose the folder the PC import tool made (named like CUSA07408). It shows up under Games after you restart XStation.</p><input id="dir" type="file" webkitdirectory><button id="sendDir">Send folder</button></section>
-<section><h2>PKG file</h2><p>The Xbox converts it while it arrives, so it only needs room for the game, not the PKG as well. Send the game's PKG and its update together: they go one at a time, the bigger (the game) first.</p><input id="pkg" type="file" accept=".pkg" multiple><button id="sendPkg">Send PKG</button></section>
+<section><h2>Prepared game folder</h2><p>Choose a prepared game folder (named like CUSA07408, with GameData and GameBoot inside). It shows up under Games after you restart XStation.</p><input id="dir" type="file" webkitdirectory><button id="sendDir">Send folder</button></section>
+<section><h2>PKG file</h2><p>The Xbox converts it while it arrives, so it only needs room for the game, not the PKG as well. Send the game's PKG and its update together: they go one at a time, the bigger (the game) first. Bloodborne (update 1.09) and God of War (update 1.35) need both chosen at once; the other games need only the game PKG, no update. First the Xbox reads a few MB of the game's files to check that XStation can play this copy (a copy from any country with the same game files works); nothing else is sent if it can't.</p><input id="pkg" type="file" accept=".pkg" multiple><button id="sendPkg">Send PKG</button></section>
 <section><div id="status">Nothing sent yet.</div><progress id="bar" value="0" max="1"></progress></section></main>
 <script>
 const $=id=>document.getElementById(id);let busy=false;
@@ -57,19 +63,32 @@ function fmt(n){return n>=1073741824?(n/1073741824).toFixed(2)+" GB":(n/1048576)
 async function pkgInfo(f){try{const h=new DataView(await f.slice(0,4096).arrayBuffer());if(h.byteLength<0x64||h.getUint32(0)!=0x7F434E54)return null;
  const n=h.getUint32(0x10),t=h.getUint32(0x18);if(n>100000)return null;const tb=new DataView(await f.slice(t,t+n*32).arrayBuffer());let o=-1,z=0;
  for(let i=0;i*32+32<=tb.byteLength;i++)if(tb.getUint32(i*32)==0x1000){o=tb.getUint32(i*32+16);z=tb.getUint32(i*32+20);break}
- const info={id:new TextDecoder().decode(new Uint8Array(h.buffer,0x40,36)).substr(7,9),cat:"",title:""};if(o<0||z<20||z>1048576)return info;
+ const info={id:new TextDecoder().decode(new Uint8Array(h.buffer,0x40,36)).substr(7,9),cat:"",title:"",ver:""};if(o<0||z<20||z>1048576)return info;
  const s=new DataView(await f.slice(o,o+z).arrayBuffer());if(s.byteLength<20||s.getUint32(0)!=0x00505346)return info;z=s.byteLength;
  const str=(p,l)=>{const a=new Uint8Array(s.buffer,p,Math.min(l,z-p));const e=a.indexOf(0);return new TextDecoder().decode(e<0?a:a.subarray(0,e))};
  const k=s.getUint32(8,true),v=s.getUint32(12,true),c=s.getUint32(16,true);
  for(let i=0;i<c&&20+i*16+16<=z;i++){const e=20+i*16,key=k+s.getUint16(e,true),fm=s.getUint16(e+2,true),len=s.getUint32(e+4,true),val=v+s.getUint32(e+12,true);
-  if(key>=z||fm!=0x0204||val+len>z)continue;const name=str(key,z),text=str(val,len);if(name=="CATEGORY")info.cat=text;else if(name=="TITLE_ID"&&text)info.id=text;else if(name=="TITLE")info.title=text}
+  if(key>=z||fm!=0x0204||val+len>z)continue;const name=str(key,z),text=str(val,len);if(name=="CATEGORY")info.cat=text;else if(name=="TITLE_ID"&&text)info.id=text;else if(name=="TITLE")info.title=text;else if(name=="APP_VER")info.ver=text}
  return info}catch(e){return null}}
+// 2026-11-19: the Xbox checks the game's own files before the send: it asks for the PKG bytes it needs (tables, eboot.bin,
+// modules, param.sfo) and this page sends just those slices. Empty when it's compatible, else why it wasn't sent.
+async function probe(code,i,upd){const files=[i.file].concat(upd?[upd]:[]),h={"X-Pair-Code":code};let read=0;
+ const say=()=>$("status").textContent="Checking that "+(i.title||i.id)+" is compatible… ("+fmt(read)+" of its files read)";say();
+ let r=await fetch("/probe/start?id="+encodeURIComponent(i.id)+"&sizes="+files.map(f=>f.size).join(","),{method:"POST",headers:h}).catch(()=>null);
+ for(;;){if(!r)return"Lost the connection to the Xbox while checking the PKG. Send it again.";const t=await r.text();
+  if(r.status==409)return t;if(r.status!=200)return t||"The Xbox couldn't check the PKG ("+r.status+"). Send it again.";
+  const p=t.split(" ");if(p[0]=="ok")return"";if(p[0]!="need")return"The Xbox gave an answer this page doesn't know: "+t;
+  const f=files[+p[1]],o=+p[2],l=+p[3];read+=l;say();
+  r=await fetch("/probe/data?offset="+o,{method:"PUT",headers:h,body:await f.slice(o,o+l).arrayBuffer()}).catch(()=>null)}}
 async function send(list,lanes=4){ if(busy)return; const code=$("code").value.trim(); if(!/^\d{6}$/.test(code)){$("status").textContent="Enter the 6-digit pairing code first.";return}
  if(!list.length){$("status").textContent="Choose something to send first.";return}
  const checked=await fetch("/check",{headers:{"X-Pair-Code":code}}).catch(()=>null);if(!checked||checked.status!=204){$("status").textContent=checked?"Wrong pairing code.":"Can't reach the Xbox. Is XStation open on the Add Game page?";return}
- for(const x of list){if(!x.path.startsWith("Import/"))continue;$("status").textContent="Checking "+x.file.name+"\u2026";const i=await pkgInfo(x.file);if(!i||!i.cat)continue;
-  const r=await fetch("/pkgcheck?id="+encodeURIComponent(i.id)+"&cat="+encodeURIComponent(i.cat),{headers:{"X-Pair-Code":code}}).catch(()=>null);
+ const infos=[];for(const x of list){if(!x.path.startsWith("Import/"))continue;$("status").textContent="Checking "+x.file.name+"\u2026";const i=await pkgInfo(x.file);if(i&&i.cat){i.file=x.file;infos.push(i)}}
+ for(const i of infos){const game=infos.some(o=>o.id==i.id&&o.cat=="gd"),upd=infos.filter(o=>o.id==i.id&&o.cat=="gp").map(o=>o.ver).join(",");
+  const r=await fetch("/pkgcheck?id="+encodeURIComponent(i.id)+"&cat="+encodeURIComponent(i.cat)+"&ver="+encodeURIComponent(i.ver)+"&withgame="+(game?1:0)+"&withupdate="+encodeURIComponent(upd)+"&probe=1",{headers:{"X-Pair-Code":code}}).catch(()=>null);
   if(r&&r.status==409){$("status").textContent=(i.title?i.title+": ":"")+await r.text();return}}
+ for(const i of infos){if(i.cat!="gd")continue;const u=infos.filter(o=>o.id==i.id&&o.cat=="gp").sort((a,b)=>a.ver<b.ver?1:-1)[0];
+  const m=await probe(code,i,u&&u.file);if(m){$("status").textContent=(i.title?i.title+": ":"")+m;return}}
  const top=list[0].path.split("/").slice(0,2).join("/");if(top.startsWith("Games/")){$("status").textContent="Checking free space…";
   const r=await fetch("/spacecheck?bytes="+list.reduce((a,x)=>a+x.file.size,0)+"&folder="+encodeURIComponent(top),{headers:{"X-Pair-Code":code}}).catch(()=>null);
   if(r&&r.status==507){$("status").textContent=await r.text();return}}
@@ -269,7 +288,297 @@ void PkgCheck(SOCKET s, const std::string& head, const std::string& target) {
             return;
         }
     }
+    if (safe && (cat == "gd" || cat == "gp")) {
+        const std::wstring wid(id.begin(), id.end());
+        const std::string ver = Query(target, "ver"), withUpdate = "," + Query(target, "withupdate") + ",";
+        const bool withGame = Query(target, "withgame") == "1";
+        const std::wstring needed = GameNeededUpdate(wid);
+        const std::string need(needed.begin(), needed.end());
+        auto shortVer = [](std::string v) { while (v.size() > 1 && v[0] == '0' && v[1] != '.') v.erase(0, 1); return std::wstring(v.begin(), v.end()); };
+        const std::wstring folder = root + L"\\Games\\" + wid;
+        const bool gameThere = GetFileAttributesW((folder + L"\\" + GamePrepareDataFolder(wid)).c_str()) != INVALID_FILE_ATTRIBUTES &&
+                               GetFileAttributesW((folder + L"\\.xstation-converting").c_str()) == INVALID_FILE_ATTRIBUTES;
+        if (!GamePrepareSupported(GameEngineId(wid)) && Query(target, "probe") == "1") {
+            if (cat == "gp" && !withGame && !gameThere) {
+                Message(s, "409 Conflict", L"Choose the game PKG and this update PKG together (both in the file picker), then send: XStation checks "
+                                           L"them together.");
+                return;
+            }
+            Plain(s, "204 No Content");
+            return;
+        }
+        if (!GamePrepareSupported(GameEngineId(wid))) {
+            Message(s, "409 Conflict", L"Not compatible: XStation has no engine for this game (" + wid + L"), or this region of it isn't "
+                                       L"known to work, so it wasn't sent. If it's another region of a game on the Compatible tab, put the "
+                                       L"PKG on a USB drive: XStation checks the game itself there before converting.");
+            return;
+        }
+        if (cat == "gd" && !ver.empty() && ver != "01.00" && ver != need) {
+            Message(s, "409 Conflict", L"Not compatible: this copy is version " + shortVer(ver) + L", but XStation plays this game as 1.00" +
+                                       (need.empty() ? std::wstring(L" with no update") : L" with update " + shortVer(need)) +
+                                       L", so it wasn't sent.");
+            return;
+        }
+        if (cat == "gd" && !need.empty() && ver != need && withUpdate.find("," + need + ",") == std::string::npos) {
+            Message(s, "409 Conflict", L"This game plays with its update " + shortVer(need) + L". Choose the game PKG and the update " + shortVer(need) +
+                                       L" PKG together (both in the file picker), then send: they convert together.");
+            return;
+        }
+        if (cat == "gp" && need.empty() && GamePrepareSupported(GameEngineId(wid))) {
+            Message(s, "409 Conflict", L"XStation plays this game with no update, so this update isn't needed (it wouldn't play). Send only the game PKG.");
+            return;
+        }
+        if (cat == "gp" && !need.empty() && ver != need) {
+            Message(s, "409 Conflict", L"This update is " + shortVer(ver) + L", but the game needs update " + shortVer(need) + L". Send that update's PKG instead.");
+            return;
+        }
+        if (cat == "gp" && !need.empty() && !withGame && !gameThere) {
+            Message(s, "409 Conflict", L"Choose the game PKG and this update PKG together (both in the file picker), then send: they convert together.");
+            return;
+        }
+    }
     Plain(s, "204 No Content");
+}
+
+struct Probe {
+    std::mutex lock;
+    std::condition_variable cv;
+    std::wstring id;
+    std::vector<uint64_t> sizes;
+    bool asking = false, answered = false, cancel = false, done = false;
+    int askPkg = 0;
+    uint64_t askOffset = 0, askLength = 0;
+    std::vector<uint8_t> answer;
+    int result = -1; // 1 compatible, 0 not, -1 couldn't check
+    std::wstring engine, error;
+    uint64_t fetched = 0;
+    int trips = 0;
+};
+std::mutex probeLock;
+std::shared_ptr<Probe> currentProbe;
+std::atomic<int> probeCount{0};
+
+void WifiLog(const std::string& line) {
+    FILE* f = nullptr;
+    if (!_wfopen_s(&f, (root + L"\\xstation-wifi.log").c_str(), L"a") && f) { fputs(line.c_str(), f); fclose(f); }
+}
+
+void DeleteTree(const std::wstring& path, int depth = 0) {
+    if (depth > 32) return;
+    WIN32_FIND_DATAW f;
+    HANDLE h = FindFirstFileExW((path + L"\\*").c_str(), FindExInfoBasic, &f, FindExSearchNameMatch, nullptr, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!wcscmp(f.cFileName, L".") || !wcscmp(f.cFileName, L"..")) continue;
+            const std::wstring child = path + L"\\" + f.cFileName;
+            if ((f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(f.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) DeleteTree(child, depth + 1);
+            else DeleteFileW(child.c_str());
+        } while (FindNextFileW(h, &f));
+        FindClose(h);
+    }
+    RemoveDirectoryW(path.c_str());
+}
+
+// The worker's side: one range from the browser (false when the check was stopped or the page went away).
+bool ProbeAsk(Probe& p, int pkg, uint64_t offset, uint64_t length, std::vector<uint8_t>& out) {
+    std::unique_lock<std::mutex> lock(p.lock);
+    p.asking = true;
+    p.answered = false;
+    p.askPkg = pkg;
+    p.askOffset = offset;
+    p.askLength = length;
+    p.cv.notify_all();
+    const bool got = p.cv.wait_for(lock, std::chrono::seconds(60), [&] { return p.answered || p.cancel; }) && p.answered;
+    p.asking = false;
+    if (!got || p.answer.size() != length) return false;
+    out.swap(p.answer);
+    p.answer.clear();
+    p.answered = false;
+    p.fetched += length;
+    ++p.trips;
+    return true;
+}
+
+// The PKG reader's reads, served from 256 KiB pieces asked for in runs: a run going on from where the last one ended
+// doubles (up to 16 MiB), a jump starts again at 1 MiB, so the scattered tables cost little and a file's blocks come in a
+// few big asks.
+struct ProbeCache {
+    static constexpr uint64_t kPiece = 256 << 10;
+    std::map<uint64_t, std::vector<uint8_t>> pieces;
+    uint64_t next = UINT64_MAX, ahead = 4;
+};
+constexpr uint64_t kProbeLimit = 768ull << 20; // past this much the check gives up (couldn't check)
+
+bool ProbeRead(Probe& p, int pkg, ProbeCache& c, uint64_t offset, uint8_t* buf, size_t n) {
+    const uint64_t size = p.sizes[(size_t)pkg];
+#ifdef XSTATION_TRANSFER_LOOPBACK
+    if (getenv("XS_PROBE_TRACE")) {
+        char t[96];
+        snprintf(t, sizeof(t), "  read %d %llu %zu (size %llu)\n", pkg, (unsigned long long)offset, n, (unsigned long long)size);
+        WifiLog(t);
+    }
+#endif
+    while (n) {
+        const uint64_t index = offset / ProbeCache::kPiece;
+        auto it = c.pieces.find(index);
+        if (it == c.pieces.end()) {
+            c.ahead = index == c.next ? std::min<uint64_t>(c.ahead * 2, 64) : 4;
+            const uint64_t last = (size - 1) / ProbeCache::kPiece;
+            uint64_t count = 0;
+            while (count < c.ahead && index + count <= last && !c.pieces.count(index + count)) ++count;
+            const uint64_t from = index * ProbeCache::kPiece, length = std::min(count * ProbeCache::kPiece, size - from);
+            if (p.fetched + length > kProbeLimit) return false;
+            std::vector<uint8_t> data;
+            if (!ProbeAsk(p, pkg, from, length, data)) return false;
+            for (uint64_t i = 0; i < count; ++i) {
+                const uint64_t at = i * ProbeCache::kPiece, take = std::min(ProbeCache::kPiece, length - at);
+                c.pieces[index + i].assign(data.begin() + (ptrdiff_t)at, data.begin() + (ptrdiff_t)(at + take));
+            }
+            c.next = index + count;
+            it = c.pieces.find(index);
+        }
+        const uint64_t within = offset - index * ProbeCache::kPiece;
+        if (within >= it->second.size()) return false;
+        const size_t take = (size_t)std::min<uint64_t>(n, it->second.size() - within);
+        memcpy(buf, it->second.data() + within, take);
+        buf += take;
+        offset += take;
+        n -= take;
+    }
+    return true;
+}
+
+void ProbeWork(std::shared_ptr<Probe> p) {
+    const auto began = std::chrono::steady_clock::now();
+    const std::wstring tag = std::to_wstring(++probeCount);
+    const std::wstring scratch = root + L"\\.wifi-check-" + tag;
+    std::vector<std::wstring> paths;
+    std::vector<std::shared_ptr<ProbeCache>> caches;
+    for (size_t k = 0; k < p->sizes.size(); ++k) {
+        paths.push_back(L"wifi-check-" + tag + L"\\" + (k ? L"update.pkg" : L"game.pkg"));
+        auto cache = std::make_shared<ProbeCache>();
+        caches.push_back(cache);
+        PkgRemoteAdd(paths.back(), p->sizes[k], [p, k, cache](uint64_t offset, uint8_t* buf, size_t n) { return ProbeRead(*p, (int)k, *cache, offset, buf, n); });
+    }
+    DeleteTree(scratch);
+    CreateDirectoryW(scratch.c_str(), nullptr);
+    static const std::vector<std::string> only{"eboot.bin", "sce_module/", "sce_sys/param.sfo"};
+    std::wstring error, engine;
+    std::string detail;
+    int result = -1;
+    if (PkgExtractGame(paths, scratch, nullptr, nullptr, false, error, 0, nullptr, false, &only))
+        result = GameMatchData(p->id, scratch, enginesRoot, engine, detail) ? 1 : 0;
+    for (const auto& path : paths) PkgRemoteRemove(path);
+    DeleteTree(scratch);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    std::unique_lock<std::mutex> lock(p->lock);
+    if (p->cancel && result == -1) error = L"the check was stopped";
+    char line[256];
+    snprintf(line, sizeof(line), "wifi check %ls: %s%ls in %.1f s, %.1f MB read from the browser in %d asks\n", p->id.c_str(),
+             result == 1 ? "compatible " : result == 0 ? "not compatible" : "couldn't check: ", result == 1 ? engine.c_str() : result == -1 ? error.c_str() : L"",
+             seconds, p->fetched / 1048576.0, p->trips);
+    WifiLog(line + detail);
+    p->result = result;
+    p->engine = engine;
+    p->error = error;
+    p->done = true;
+    p->cv.notify_all();
+}
+
+// The server's side: waits for the worker's next ask or its result and replies with it.
+void ProbeReply(SOCKET s, const std::shared_ptr<Probe>& p) {
+    std::unique_lock<std::mutex> lock(p->lock);
+    if (!p->cv.wait_for(lock, std::chrono::seconds(120), [&] { return p->done || (p->asking && !p->answered); })) {
+        lock.unlock();
+        Message(s, "500 Internal Server Error", L"The Xbox didn't finish checking the PKG. Send it again.");
+        return;
+    }
+    if (!p->done) {
+        char text[96];
+        snprintf(text, sizeof(text), "need %d %llu %llu", p->askPkg, (unsigned long long)p->askOffset, (unsigned long long)p->askLength);
+        lock.unlock();
+        Reply(s, "200 OK", "text/plain", text, strlen(text));
+        return;
+    }
+    const int result = p->result;
+    const std::wstring id = p->id, engine = p->engine, error = p->error;
+    lock.unlock();
+    const bool known = GamePrepareSupported(GameEngineId(id));
+    if (result == 1) {
+        const std::string text = "ok " + std::string(engine.begin(), engine.end());
+        Reply(s, "200 OK", "text/plain", text.data(), text.size());
+    } else if (result == 0) {
+        Message(s, "409 Conflict", known ? L"Not compatible: this copy's game files aren't the ones XStation plays (another version, or a modified copy), "
+                                           L"so it wasn't sent."
+                                         : L"Not compatible: XStation has no engine for this game (" + id + L"), and its game files aren't the same as "
+                                           L"any game XStation plays, so it wasn't sent.");
+    } else if (known) {
+        Reply(s, "200 OK", "text/plain", "ok", 2); // couldn't read the files (a PKG type the check can't open): a known title still goes
+    } else {
+        Message(s, "409 Conflict", L"XStation couldn't check this PKG's game files (" + error + L"), and it has no engine for " + id +
+                                   L", so it wasn't sent. Try it from a USB drive.");
+    }
+}
+
+void ProbeStart(SOCKET s, const std::string& head, const std::string& target) {
+    if (!Paired(s, head)) return;
+    if (streaming) { Message(s, "409 Conflict", L"Another PKG is being converted. Send PKGs one at a time."); return; }
+    const std::string id = Query(target, "id"), sizes = Query(target, "sizes");
+    bool safe = id.size() == 9;
+    for (const char c : id) safe = safe && isalnum((unsigned char)c);
+    auto p = std::make_shared<Probe>();
+    p->id.assign(id.begin(), id.end());
+    for (size_t at = 0; at < sizes.size();) {
+        size_t end = sizes.find(',', at);
+        if (end == std::string::npos) end = sizes.size();
+        p->sizes.push_back(_strtoui64(sizes.substr(at, end - at).c_str(), nullptr, 10));
+        at = end + 1;
+    }
+    if (!safe || p->sizes.empty() || p->sizes.size() > 2) { Plain(s, "400 Bad Request"); return; }
+    for (const uint64_t z : p->sizes) if (z < 0x1000) { Plain(s, "400 Bad Request"); return; }
+    if (enginesRoot.empty()) { Reply(s, "200 OK", "text/plain", "ok", 2); return; }
+    {
+        std::lock_guard<std::mutex> lock(probeLock);
+        if (currentProbe) {
+            std::lock_guard<std::mutex> old(currentProbe->lock);
+            currentProbe->cancel = true;
+            currentProbe->cv.notify_all();
+        }
+        currentProbe = p;
+    }
+    std::thread(ProbeWork, p).detach();
+    ProbeReply(s, p);
+}
+
+void ProbeData(SOCKET s, const std::string& head, const std::string& target, const char* extra, size_t extraSize) {
+    if (!Paired(s, head)) return;
+    std::shared_ptr<Probe> p;
+    {
+        std::lock_guard<std::mutex> lock(probeLock);
+        p = currentProbe;
+    }
+    const uint64_t offset = _strtoui64(Query(target, "offset").c_str(), nullptr, 10);
+    const uint64_t length = _strtoui64(Header(head, "content-length").c_str(), nullptr, 10);
+    if (!p || length > (32ull << 20)) { Plain(s, "400 Bad Request"); return; }
+    std::vector<uint8_t> data((size_t)length);
+    size_t have = std::min<size_t>(extraSize, (size_t)length);
+    memcpy(data.data(), extra, have);
+    while (have < length) {
+        const int n = recv(s, reinterpret_cast<char*>(data.data()) + have, (int)std::min<size_t>(length - have, 1 << 20), 0);
+        if (n <= 0) { Plain(s, "400 Bad Request"); return; }
+        have += (size_t)n;
+    }
+    {
+        std::lock_guard<std::mutex> lock(p->lock);
+        if (p->done || !p->asking || p->answered || offset != p->askOffset || length != p->askLength) {
+            // not what was asked: the check goes on waiting for the right bytes
+        } else {
+            p->answer.swap(data);
+            p->answered = true;
+            p->cv.notify_all();
+        }
+    }
+    ProbeReply(s, p);
 }
 
 uint64_t FolderBytes(const std::wstring& folder, int depth = 0) {
@@ -287,9 +596,6 @@ uint64_t FolderBytes(const std::wstring& folder, int depth = 0) {
     return sum;
 }
 
-// 2026-11-18: GET
-// /spacecheck?bytes=<total>&folder=Games/<name>, before a game folder is sent: 507 + the not-enough-storage message when
-// it doesn't fit, else 204. Files already in that folder count as room (sending again replaces them).
 void SpaceCheck(SOCKET s, const std::string& head, const std::string& target) {
     if (!Paired(s, head)) return;
     const uint64_t bytes = _strtoui64(Query(target, "bytes").c_str(), nullptr, 10);
@@ -395,6 +701,8 @@ void Connection(SOCKET s) {
     }
     else if (method == "GET" && target.rfind("/pkgcheck?", 0) == 0) PkgCheck(s, head, target);
     else if (method == "GET" && target.rfind("/spacecheck?", 0) == 0) SpaceCheck(s, head, target);
+    else if (method == "POST" && target.rfind("/probe/start?", 0) == 0) ProbeStart(s, head, target);
+    else if (method == "PUT" && target.rfind("/probe/data?", 0) == 0) ProbeData(s, head, target, data.data() + end + 4, data.size() - end - 4);
     else if (method == "GET" && target == "/pkgresult") {
         if (Paired(s, head)) {
             std::wstring why;
@@ -455,6 +763,8 @@ bool StartTransferServer(const std::wstring& dataRoot, std::string& pairingCode,
     }).detach();
     return true;
 }
+
+void SetTransferEngines(const std::wstring& engines) { enginesRoot = engines; }
 
 TransferState GetTransferState() {
     TransferState state;

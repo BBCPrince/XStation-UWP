@@ -17,3 +17,5 @@ struct TransferState {
 };
 bool StartTransferServer(const std::wstring& dataRoot, std::string& pairingCode, int port);
 TransferState GetTransferState();
+// 2026-11-19: the Engines folder, for the game-file check before a Wi-Fi PKG send (call before StartTransferServer).
+void SetTransferEngines(const std::wstring& enginesRoot);

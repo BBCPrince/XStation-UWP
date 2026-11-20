@@ -921,7 +921,39 @@ void GameEnginesConfigure(const std::wstring& localState) {
 std::wstring GameEngineId(const std::wstring& titleId) {
     std::lock_guard<std::mutex> lock(g_engineLock);
     const auto it = g_aliases.find(titleId);
-    return it == g_aliases.end() ? titleId : it->second;
+    if (it != g_aliases.end()) return it->second;
+    // 2026-11-18: other regions' copies already found to be the exact same image (so Wi-Fi can accept them before
+    // anything is sent). The Last of Us Europe 1.00: same eboot and modules as US CUSA00552 (preptest, 2026-11-18).
+    if (titleId == L"CUSA00556") return L"CUSA00552";
+    return titleId;
+}
+
+std::wstring GameNeededUpdate(const std::wstring& titleId) {
+    const std::wstring engine = GameEngineId(titleId);
+    if (engine == L"CUSA00900") return L"01.09"; // Bloodborne: game + update 1.09
+    if (engine == L"CUSA07408") return L"01.35"; // God of War: game + update 1.35
+    return L"";
+}
+
+bool GameMatchData(const std::wstring& titleId, const std::wstring& gameData, const std::wstring& enginesRoot, std::wstring& engineId,
+                   std::string& detail) {
+    const std::wstring own = GameEngineId(titleId);
+    std::vector<const Recipe*> order;
+    if (const Recipe* r = FindRecipe(own)) order.push_back(r);
+    for (const auto& r : kRecipes) if (std::find(order.begin(), order.end(), &r) == order.end()) order.push_back(&r);
+    for (const Recipe* r : order) {
+        const std::wstring engineDir = enginesRoot + L"\\" + r->title;
+        const std::string name(r->title, r->title + wcslen(r->title));
+        if (!IsFolder(engineDir)) { detail += "  " + name + ": no engine folder\n"; continue; }
+        std::vector<uint8_t> boot, content, memory;
+        std::wstring e;
+        std::string d;
+        const bool built = GamePrepareImages(r->title, gameData, engineDir, boot, content, e, d, &memory);
+        const bool same = built && HexSha256(boot) == r->sha256 && (!r->guardSites || HexSha256(memory) == r->guardSha256);
+        detail += "  " + name + ": " + (same ? "same image" : built ? "different image" : "can't link") + "\n";
+        if (same) { engineId = r->title; return true; }
+    }
+    return false;
 }
 
 bool GamePrepareAny(const std::wstring& titleId, const std::wstring& gameFolder, const std::wstring& enginesRoot, std::wstring& engineId,

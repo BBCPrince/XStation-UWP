@@ -28,12 +28,6 @@ struct PkgParams {
 };
 bool PkgReadParams(const std::wstring& pkg, PkgParams& params, std::wstring& error);
 
-// 2026-11-18: the one message every
-// convert / copy / Wi-Fi path shows when the game doesn't fit:
-// "Not enough storage. This game needs 59.6 GB of free space on the Xbox, and it has 20.3 GB free.
-//  Free up at least 39.3 GB (delete games or files you don't need) and try again."
-// `need` and `freeBytes` in bytes; `where` names the drive ("the Xbox", "the USB drive"); `lead` replaces the first
-// sentence when the case needs it.
 std::wstring NotEnoughStorageText(uint64_t need, uint64_t freeBytes, const std::wstring& where = L"the Xbox",
                                   const std::wstring& lead = L"Not enough storage.");
 
@@ -62,9 +56,15 @@ struct PkgShrink {
 // `rewriteUpdates` (2026-11-14): an update added to a game already converted into outDir (pkgs = game, update): every
 // file the update brings is written again even when one of the same size is there (the game's own version), the
 // game's files are kept. Not for a resumed using-up conversion (its PKGs are already cut).
+// `only` (2026-11-18, the compatibility check before a convert): just the files whose lower-case path is one of these or
+// starts with one ending in '/' (e.g. "eboot.bin", "sce_module/", "sce_sys/param.sfo").
 bool PkgExtractGame(const std::vector<std::wstring>& pkgs, const std::wstring& outDir, PkgProgress* progress,
                     const std::atomic<bool>* cancel, bool resume, std::wstring& error, uint64_t freeBytes = 0,
-                    PkgShrink* shrink = nullptr, bool rewriteUpdates = false);
+                    PkgShrink* shrink = nullptr, bool rewriteUpdates = false, const std::vector<std::string>* only = nullptr);
+
+using PkgRemoteRead = std::function<bool(uint64_t offset, uint8_t* buf, size_t n)>;
+void PkgRemoteAdd(const std::wstring& path, uint64_t size, PkgRemoteRead read);
+void PkgRemoteRemove(const std::wstring& path);
 
 // Wi-Fi streaming check (PC tool): how much of the PKG must arrive before the files can be planned, and the peak space a
 // convert while receiving would need with the PKG kept as `chunk`-byte pieces.
