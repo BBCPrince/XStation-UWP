@@ -18,7 +18,16 @@ struct PkgInfo {
 struct PkgProgress {
     std::atomic<uint64_t> done{0}, total{0}; // bytes written / to write (all PKGs of one conversion)
     std::atomic<uint32_t> files{0}, filesTotal{0};
+    // 2026-11-20: game files with parts that wouldn't unpack (a damaged PKG), written with zeros there instead of
+    // stopping the convert; at most kMaxDamagedBlocks blocks (64 KiB each) in all, then it stops as before.
+    std::atomic<uint32_t> damagedBlocks{0};
+    std::mutex damagedLock;
+    std::vector<std::string> damaged; // paths inside the game folder, under damagedLock
 };
+// "N damaged files were filled with zeros (first: name)..." for the convert result, or "" when none.
+std::wstring PkgDamagedText(PkgProgress& progress);
+// Writes the list to <gameFolder>\xstation-damaged.txt (deleted when there is none).
+void PkgDamagedSave(PkgProgress& progress, const std::wstring& gameFolder);
 
 // From the PKG's own param.sfo (Sc0, decrypted when needed): CATEGORY "gd" = game, "gp" = patch (an update's header
 // can say "game"), APP_VER, VERSION, TITLE (UTF-8), TITLE_ID.

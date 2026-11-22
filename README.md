@@ -6,7 +6,7 @@
 
 XStation provides a console dashboard, game details and settings, USB discovery, Wi-Fi transfer, and on-console import/preparation for supported PS4 game dumps supplied by the user.
 
-Version **0.1.4.6** adds compatibility checks before PKG conversion and Wi-Fi upload, game/update pairing, USB log export, and guidance when Xbox Dev Home has XStation set as an App instead of a Game. Download the MSIX from [Releases](https://github.com/BBCPrince/XStation-UWP/releases).
+Version **0.1.4.25** addresses The Last of Us's startup buffer-arena crash reported on Xbox Series S, includes Bloodborne stability fixes, and improves PKG conversion error messages. Download the MSIX from [Releases](https://github.com/BBCPrince/XStation-UWP/releases).
 
 [Game compatibility and FPS](docs/COMPATIBILITY.md) | [Build from source](docs/BUILD.md) | [Runtime build guide](docs/RUNTIMES.md) | [Source scope](SOURCE-SCOPE.md) | [Third-party notices](THIRD_PARTY_NOTICES.md)
 

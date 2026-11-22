@@ -39,6 +39,21 @@ uint64_t Le64(const uint8_t* p) { return uint64_t(Le32(p)) | uint64_t(Le32(p + 4
 
 std::wstring Wide(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
+// 2026-11-20: why the last PKG read on this thread failed, for the convert error. A player's Bloodborne convert said only
+// "Couldn't extract ... The PKG may be damaged", which can't tell a drive read error from a short or damaged PKG. The
+// first failure is kept (the cause); the layers above it fail too and don't overwrite it.
+struct ReadFail {
+    enum Kind { None, Drive, PastEnd, Unpack, Table } kind = None;
+    DWORD code = 0;    // Drive: GetLastError
+    uint64_t at = 0;   // Drive, PastEnd: offset in the PKG file
+    uint64_t size = 0; // PastEnd: the file's size
+};
+thread_local ReadFail g_readFail;
+void NoteReadFail(ReadFail::Kind kind, uint64_t at = 0, DWORD code = 0, uint64_t size = 0) {
+    if (g_readFail.kind == ReadFail::None) g_readFail = {kind, code, at, size};
+}
+std::wstring GbText(uint64_t bytes) { wchar_t t[32]; swprintf_s(t, L"%.1f GB", bytes / 1073741824.0); return t; }
+
 // ---- crypto (BCrypt) ----
 struct Algorithms {
     BCRYPT_ALG_HANDLE sha = nullptr, hmac = nullptr, cbc = nullptr, ecb = nullptr, rsa = nullptr;
@@ -197,7 +212,8 @@ struct FileSource : Source {
             at.OffsetHigh = DWORD(offset >> 32);
             const DWORD chunk = DWORD(std::min<size_t>(n, 1u << 30));
             DWORD got = 0;
-            if (!ReadFile(h, buf, chunk, &got, &at) || got == 0) return false;
+            if (!ReadFile(h, buf, chunk, &got, &at)) { NoteReadFail(ReadFail::Drive, offset, GetLastError()); return false; }
+            if (got == 0) { NoteReadFail(ReadFail::PastEnd, offset, 0, actual); return false; }
             buf += got; offset += got; n -= got;
         }
         return true;
@@ -410,9 +426,9 @@ struct PfsFileSource : Source {
     std::vector<uint8_t> cache = std::vector<uint8_t>(kBlock);
     bool Read(uint64_t offset, uint8_t* buf, size_t n) override {
         while (n) {
-            if (offset >= length) return false;
+            if (offset >= length) { NoteReadFail(ReadFail::Table); return false; }
             const uint64_t index = offset / kBlock;
-            if (index >= blocks.size()) return false;
+            if (index >= blocks.size()) { NoteReadFail(ReadFail::Table); return false; }
             if ((int64_t)index != cached) {
                 if (!pfs->ReadBlock(blocks[index], cache.data())) return false;
                 cached = (int64_t)index;
@@ -462,11 +478,12 @@ struct PfscSource : Source {
         if (index == cached) { out = &cache; return true; }
         const uint64_t count = offsets.size() - 1;
         const uint64_t start = offsets[index], end = offsets[index + 1];
-        if (end < start || end - start > (64u << 20)) return false;
+        if (end < start || end - start > (64u << 20)) { NoteReadFail(ReadFail::Table); return false; }
         const size_t compressed = size_t(end - start);
         packed.resize(compressed);
         if (compressed && !src->Read(start, packed.data(), compressed)) return false;
         const size_t expected = uint64_t(index) + 1 < count ? blockSize : size_t(length - (count - 1) * uint64_t(blockSize));
+        cached = -1; // (2026-11-20: a block that fails to unpack used to leave the old index on the overwritten cache)
         cache.assign(expected, 0);
         if (compressed == blockSize) {
             memcpy(cache.data(), packed.data(), std::min<size_t>(expected, compressed));
@@ -474,7 +491,7 @@ struct PfscSource : Source {
             const bool zlib = compressed >= 2 && (packed[0] & 0x0F) == 0x08;
             const size_t got = tinfl_decompress_mem_to_mem(cache.data(), expected, packed.data(), compressed,
                                                            zlib ? TINFL_FLAG_PARSE_ZLIB_HEADER : 0);
-            if (got == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) return false;
+            if (got == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) { NoteReadFail(ReadFail::Unpack); return false; }
             cache.resize(got);
         }
         cached = index;
@@ -485,11 +502,11 @@ struct PfscSource : Source {
 
     bool Read(uint64_t offset, uint8_t* buf, size_t n) override {
         while (n) {
-            if (offset >= length) return false;
+            if (offset >= length) { NoteReadFail(ReadFail::Table); return false; }
             const std::vector<uint8_t>* block = nullptr;
             if (!Block(int64_t(offset / blockSize), block)) return false;
             const size_t in = size_t(offset % blockSize);
-            if (in >= block->size()) return false;
+            if (in >= block->size()) { NoteReadFail(ReadFail::Unpack); return false; }
             const size_t take = (size_t)std::min<uint64_t>({block->size() - in, n, length - offset});
             memcpy(buf, block->data() + in, take);
             buf += take; offset += take; n -= take;
@@ -553,6 +570,7 @@ public:
             ImageToPkg(pfsc.offsets[i], pfsc.offsets[i + 1] - pfsc.offsets[i], out);
     }
     uint64_t PfsOffset() const { return pfsOffset_; }
+    uint64_t PkgSize() const { return pkgSize_; }
 
     Source* raw = &file; // the PKG's bytes: the file, or a PKG arriving over Wi-Fi (PkgStream)
 
@@ -578,6 +596,7 @@ public:
         contentId.assign(reinterpret_cast<const char*>(h + 0x40), strnlen(reinterpret_cast<const char*>(h + 0x40), 0x30));
         pfsOffset_ = Be64(h + 0x410);
         pfsSize_ = Be64(h + 0x418);
+        pkgSize_ = Be64(h + 0x430); // the whole PKG's size (both Bloodborne PKGs: equal to the file's)
         return true;
     }
 
@@ -701,6 +720,12 @@ private:
     // EKPFS from IMAGE_KEY (AES-CBC with dk3, then RSA with the fake key set); then the outer PFS, pfs_image.dat in it, the
     // PFSC image in that, and the inner PFS with the game files.
     bool OpenImage(std::wstring& err) {
+        // 2026-11-20: a PKG file cut short (a download or copy that didn't finish) used to look like one with no game files.
+        if (pfsOffset_ && pfsOffset_ + pfsSize_ > raw->Size() && raw == &file && !file.remote && pkgSize_ > raw->Size()) {
+            err = L"The PKG ends early: it's " + GbText(raw->Size()) + L", but it should be " + GbText(pkgSize_) +
+                  L". The download or copy didn't finish. Copy or download it again.";
+            return false;
+        }
         if (!pfsOffset_ || pfsOffset_ + pfsSize_ > raw->Size()) return true; // no game files (some add-ons)
         uint8_t ekpfs[32];
         bool haveKey = false;
@@ -767,7 +792,7 @@ private:
     }
 
     uint32_t entryCount_ = 0, entryTable_ = 0;
-    uint64_t pfsOffset_ = 0, pfsSize_ = 0;
+    uint64_t pfsOffset_ = 0, pfsSize_ = 0, pkgSize_ = 0;
     uint8_t dk_[7][32]{};
 };
 
@@ -1012,6 +1037,72 @@ bool PkgReadParams(const std::wstring& path, PkgParams& out, std::wstring& error
     return true;
 }
 
+// 2026-11-20: "Couldn't extract <file>" and why, from the read that failed (g_readFail); `otherwise` when no read failed.
+std::wstring ExtractFailText(const std::string& path, uint64_t pkgSize, const std::wstring& otherwise) {
+    const ReadFail f = g_readFail;
+    const std::wstring name = L"Couldn't extract " + Wide(path), lead = name + L": ";
+    const std::wstring code = L"error " + std::to_wstring(f.code);
+    switch (f.kind) {
+    case ReadFail::Drive:
+        if (f.code == ERROR_NOT_READY || f.code == ERROR_DEVICE_NOT_CONNECTED || f.code == ERROR_NO_SUCH_DEVICE || f.code == ERROR_DEV_NOT_EXIST)
+            return lead + L"the drive stopped answering (" + code + L"). Check it's plugged in firmly, then convert again; it carries on where it stopped.";
+        if (f.code == ERROR_CRC || f.code == ERROR_IO_DEVICE || f.code == ERROR_SECTOR_NOT_FOUND || f.code == ERROR_DEVICE_HARDWARE_ERROR)
+            return lead + L"the drive couldn't read part of the PKG (" + code + L", " + GbText(f.at) +
+                   L" in). The drive may have a bad spot: copy the PKG to it again, or use another drive.";
+        return lead + L"reading the PKG failed (" + code + L", " + GbText(f.at) +
+               L" in). Convert again; it carries on where it stopped. If it fails here again, copy the PKG again.";
+    case ReadFail::PastEnd:
+        if (pkgSize > f.size)
+            return lead + L"the PKG ends early: it's " + GbText(f.size) + L", but it should be " + GbText(pkgSize) + L". Copy or download it again.";
+        return lead + L"the PKG's file table points past its end, so the PKG is damaged. Copy or download it again.";
+    case ReadFail::Unpack:
+        return lead + L"part of the PKG is damaged (its data won't unpack). Copy or download it again.";
+    case ReadFail::Table:
+        return lead + L"the PKG's file table is damaged. Copy or download it again.";
+    default:
+        return name + otherwise;
+    }
+}
+
+constexpr uint32_t kMaxDamagedBlocks = 1024;
+bool ReadGameBlock(Pfs& inner, int64_t blockNo, uint8_t* out, const std::string& path, PkgProgress* progress, bool& listed) {
+    g_readFail = {};
+    if (inner.ReadBlock(blockNo, out)) return true;
+    if (!progress || (g_readFail.kind != ReadFail::Unpack && g_readFail.kind != ReadFail::Table)) return false;
+    if (++progress->damagedBlocks > kMaxDamagedBlocks) return false;
+    memset(out, 0, kBlock);
+    g_readFail = {};
+    if (!listed) {
+        std::lock_guard<std::mutex> l(progress->damagedLock);
+        progress->damaged.push_back(path);
+        listed = true;
+    }
+    return true;
+}
+
+std::wstring PkgDamagedText(PkgProgress& progress) {
+    std::lock_guard<std::mutex> l(progress.damagedLock);
+    if (progress.damaged.empty()) return L"";
+    const std::string& first = progress.damaged.front();
+    const std::wstring name = Wide(first.substr(first.find_last_of('/') + 1));
+    const size_t n = progress.damaged.size();
+    return L" Warning: the PKG is damaged; " + std::to_wstring(n) + (n == 1 ? L" file was" : L" files were") +
+           L" filled in with zeros (" + name + (n > 1 ? L" and others" : L"") + L"). The game may crash or look wrong there.";
+}
+
+void PkgDamagedSave(PkgProgress& progress, const std::wstring& gameFolder) {
+    const std::wstring path = gameFolder + L"\\xstation-damaged.txt";
+    std::lock_guard<std::mutex> l(progress.damagedLock);
+    if (progress.damaged.empty()) { DeleteFileFromAppW(path.c_str()); return; }
+    std::string text = "Files of this game the PKG had damaged data for (filled in with zeros there):\r\n";
+    for (const auto& p : progress.damaged) text += p + "\r\n";
+    HANDLE h = CreateFile2FromAppW(path.c_str(), GENERIC_WRITE, 0, CREATE_ALWAYS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(h, text.data(), DWORD(text.size()), &wrote, nullptr);
+    CloseHandle(h);
+}
+
 bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& outDir, PkgProgress* progress,
                     const std::atomic<bool>* cancel, bool resume, std::wstring& error, uint64_t freeBytes, PkgShrink* shrink,
                     bool rewriteUpdates, const std::vector<std::string>* only) {
@@ -1179,22 +1270,25 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
     // One planned file's bytes from the PKG, in order, to `sink`.
     auto readItem = [&](const Item& it, const std::function<bool(const uint8_t*, size_t)>& sink) -> bool {
         Pkg& pkg = *pkgs[it.pkg];
+        g_readFail = {};
         if (it.sc0) return pkg.CopyEntry(pkg.entries[it.index], [&](const uint8_t* p, size_t n) {
             if (progress) progress->done += n;
             return sink(p, n);
         }, cancel);
         const Inode* ino = pkg.inner.Get(it.index);
         std::vector<int64_t> blocks;
-        if (!ino || !pkg.inner.Blocks(*ino, blocks)) return false;
+        if (!ino || !pkg.inner.Blocks(*ino, blocks)) { NoteReadFail(ReadFail::Table); return false; }
         uint64_t left = ino->size;
+        bool listed = false;
         for (size_t b = 0; b < blocks.size() && left; ++b) {
             if (blocks[b] <= 0) break;
-            if ((cancel && *cancel) || !pkg.inner.ReadBlock(blocks[b], block.data())) return false;
+            if ((cancel && *cancel) || !ReadGameBlock(pkg.inner, blocks[b], block.data(), it.path, progress, listed)) return false;
             const size_t n = (size_t)std::min<uint64_t>(kBlock, left);
             if (!sink(block.data(), n)) return false;
             left -= n;
             if (progress) progress->done += n;
         }
+        if (left) NoteReadFail(ReadFail::Table);
         return !left;
     };
     // One planned file into <dest>.part, then renamed.
@@ -1212,7 +1306,7 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
         if (ok) DeleteFileFromAppW(dest.c_str()); // MoveFileFromAppW doesn't replace
         if (!ok || !MoveFileFromAppW(part.c_str(), dest.c_str())) {
             DeleteFileFromAppW(part.c_str());
-            error = (cancel && *cancel) ? L"Stopped." : L"Couldn't extract " + Wide(it.path) + L". The drive may be full or unplugged, or the PKG is damaged.";
+            error = (cancel && *cancel) ? L"Stopped." : ExtractFailText(it.path, pkgs[it.pkg]->PkgSize(), L". The drive may be full or unplugged, or the PKG is damaged.");
             return false;
         }
         if (progress) ++progress->files;
@@ -1295,7 +1389,7 @@ bool PkgExtractGame(const std::vector<std::wstring>& paths, const std::wstring& 
             if (!folders.For(f.dest)) { error = L"Couldn't make the folder for " + Wide(it.path) + L"."; return finish(false); }
             f.data.reserve((size_t)it.size);
             if (!readItem(it, [&](const uint8_t* p, size_t n) { f.data.insert(f.data.end(), p, p + n); return true; })) {
-                error = (cancel && *cancel) ? L"Stopped." : L"Couldn't extract " + Wide(it.path) + L". The PKG may be damaged.";
+                error = (cancel && *cancel) ? L"Stopped." : ExtractFailText(it.path, pkgs[it.pkg]->PkgSize(), L". The PKG may be damaged.");
                 return finish(false);
             }
             {
@@ -1822,9 +1916,10 @@ struct PkgStream::Impl {
                     std::map<size_t, std::vector<uint64_t>> freeAfter;
                     for (const auto& [p, b] : lastUse) freeAfter[b].push_back(p);
                     uint64_t left = ino ? ino->size : 0;
+                    bool listed = false;
                     for (size_t b = 0; ok && b < blocks.size() && left; ++b) {
                         if (blocks[b] <= 0) break;
-                        if (!pkg.inner.ReadBlock(blocks[b], block.data())) { ok = false; break; }
+                        if (!ReadGameBlock(pkg.inner, blocks[b], block.data(), it.path, &status.progress, listed)) { ok = false; break; }
                         const size_t n = (size_t)std::min<uint64_t>(kBlock, left);
                         if (!out.Write(block.data(), n)) { ok = false; break; }
                         left -= n;
@@ -1855,6 +1950,7 @@ struct PkgStream::Impl {
             std::ofstream size(target + L"\\xstation-game.txt", std::ios::trunc | std::ios::binary);
             size << total;
         }
+        PkgDamagedSave(status.progress, target);
         status.phase = 3;
     }
 

@@ -186,6 +186,7 @@ private:
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
     const Buffer* GetDenseArena(u64 first_block, u64 last_block, bool overlay = false);
+    const Buffer* SplitDenseArena(u64 first_page, u64 last_page, u64 joined, u64 limit, bool mapped);
     void UpdateDensePageTable(const Buffer* arena, std::span<const Interval> ranges);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);

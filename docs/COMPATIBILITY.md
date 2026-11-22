@@ -1,6 +1,6 @@
 # Game compatibility and performance
 
-Last reviewed: **2026-11-19**. These are recorded **Xbox Series X Developer Mode** results, not general emulator compatibility claims. Series S has not been verified. No complete campaign has been verified for any title.
+Last reviewed: **2026-11-22**. These are recorded **Xbox Series X Developer Mode** results, not general emulator compatibility claims. Version 0.1.4.25 addresses a TLOU startup buffer-arena assertion reported on Series S; a full Series S gameplay test is not established by these records. No complete campaign has been verified for any title.
 
 **Build scope:** gameplay results below come from earlier installed development binaries. The source rebuild documented in [BUILD-VALIDATION.json](BUILD-VALIDATION.json) passed build/package checks, but has **not** been gameplay-tested. Rebuilding this repository does not guarantee the same results. God of War and Detroit's later development tests also differ from their packaged engine snapshots.
 

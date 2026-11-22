@@ -1291,6 +1291,7 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block,u64 last_block,bool ove
         current->last_use_epoch = use_epoch;
         return current;
     }
+    const u64 asked_first = first_page, asked_last = last_page;
     std::vector<const Buffer*> previous;
     bool expanded;
     do {
@@ -1305,7 +1306,6 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block,u64 last_block,bool ove
     } while(expanded);
     const VAddr base=first_page<<arena_page_bits;
     const u64 size=(last_page-first_page+1)<<arena_page_bits;
-    ASSERT_MSG(size<=instance.GetMaxBufferSize(),"Conventional arena exceeds driver buffer size");
     // bbport (integrated GPUs, unless BB_MAPPED_ARENAS=0): arenas in host-visible device memory
     // (the same RAM there), so FastReadback copies a completed writer's data on the CPU instead
     // of a GPU copy and its fence (~117 us each, ~660/s, 7.7% of the Xbox GPU command thread;
@@ -1316,6 +1316,29 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block,u64 last_block,bool ove
                instance.GetPhysicalDevice().getProperties().deviceType ==
                    vk::PhysicalDeviceType::eIntegratedGpu;
     }();
+    // XStation (2026-11-19, Series S player logs): Dozen allows buffers of a quarter of the GPU
+    // memory, 1024 MiB on a Series X but much less on a Series S (1280 MiB GPU memory), where
+    // joining the arenas around a binding went over it and stopped TLOU about 20 s in ("Conventional
+    // arena exceeds driver buffer size"). Over the limit, the arenas there are cut instead of joined
+    // (SplitDenseArena). BB_BUFFER_LIMIT_MIB sets the limit (to test a Series S's on a Series X);
+    // BB_ARENA_SPLIT=0 stops as before.
+    static const u64 arena_limit = [&] {
+        const char* env = std::getenv("BB_BUFFER_LIMIT_MIB");
+        const u64 mib = env ? std::strtoull(env, nullptr, 10) : 0;
+        const u64 limit = mib ? mib << 20 : instance.GetMaxBufferSize();
+        std::printf("Buffer arenas: limit %llu MiB (driver %llu MiB)\n",
+                    static_cast<unsigned long long>(limit >> 20),
+                    static_cast<unsigned long long>(instance.GetMaxBufferSize() >> 20));
+        return limit;
+    }();
+    static const bool split_arenas = [] {
+        const char* env = std::getenv("BB_ARENA_SPLIT");
+        return !(env && env[0] == '0');
+    }();
+    if (size > arena_limit && split_arenas) {
+        return SplitDenseArena(asked_first, asked_last, size, arena_limit, mapped_arenas);
+    }
+    ASSERT_MSG(size<=arena_limit,"Conventional arena exceeds driver buffer size");
     BbStats::Timer create_timer{BbStats::t_arena_create}; // to the end: creation, copies, tables
     auto* arena=&arenas.emplace_back(instance,base,size,
                                      mapped_arenas ? MemoryType::Stream : MemoryType::DeviceLocal);
@@ -1350,6 +1373,95 @@ const Buffer* BufferCache::GetDenseArena(u64 first_block,u64 last_block,bool ove
         memory_tracker->MarkRegionAsCpuModified(at, bytes);
     });
     return arena;
+}
+
+// XStation (2026-11-19): joining would make an arena over the driver's buffer limit (Series S). Instead
+// the asked pages get an arena of their own, and each arena reaching into them is cut into the part
+// outside them (one each side), so no arena grows. Every live arena owns all pages of its range, so the
+// parts cover exactly the old arenas' pages; their GPU data is copied on the GPU like a join's.
+const Buffer* BufferCache::SplitDenseArena(u64 first_page, u64 last_page, u64 joined, u64 limit,
+                                           bool mapped) {
+    BbStats::Timer create_timer{BbStats::t_arena_create};
+    std::vector<const Buffer*> previous;
+    for (u64 page = first_page; page <= last_page; ++page) {
+        const auto* old = address_space.Get(page);
+        if (old && std::find(previous.begin(), previous.end(), old) == previous.end()) {
+            previous.push_back(old);
+        }
+    }
+    struct Part {
+        u64 first, last;
+        Buffer* arena;
+        boost::container::small_vector<Interval, 16> preserved;
+    };
+    std::vector<Part> parts;
+    parts.push_back({first_page, last_page, nullptr, {}});
+    for (const auto* old : previous) {
+        const u64 begin = old->cpu_addr >> arena_page_bits;
+        const u64 end = (old->cpu_addr + old->SizeBytes() - 1) >> arena_page_bits;
+        if (begin < first_page) parts.push_back({begin, first_page - 1, nullptr, {}});
+        if (end > last_page) parts.push_back({last_page + 1, end, nullptr, {}});
+    }
+    const auto type = mapped ? MemoryType::Stream : MemoryType::DeviceLocal;
+    // All copies first: the page table's backings change only after every part has read the old ones.
+    for (auto& part : parts) {
+        const VAddr base = part.first << arena_page_bits;
+        const u64 size = (part.last - part.first + 1) << arena_page_bits;
+        part.arena = &arenas.emplace_back(instance, base, size, type);
+        const u64 part_begin = base >> block_shift, part_end = (base + size) >> block_shift;
+        for (const auto* old : previous) {
+            const u64 old_begin = old->cpu_addr >> block_shift;
+            const u64 old_end = (old->cpu_addr + old->SizeBytes()) >> block_shift;
+            const u64 from = std::max(part_begin, old_begin), to = std::min(part_end, old_end);
+            if (from >= to) continue;
+            boost::container::small_vector<vk::BufferCopy, 8> copies;
+            resident_ranges.ForEachInRange(from, to, [&](const Backing& r) {
+                if (IsSharedMemory(r.start << block_shift, r.memory)) return; // not this arena's
+                const u64 b = std::max(r.start, from), e = std::min(r.end, to);
+                if (b >= e) return;
+                part.preserved.push_back({b, e});
+                const u64 address = b << block_shift;
+                copies.emplace_back(address - old->cpu_addr, address - base, (e - b) << block_shift);
+            });
+            if (!copies.empty()) runtime.CopyBuffer(old, part.arena, copies);
+        }
+    }
+    for (auto& part : parts) {
+        for (u64 page = part.first; page <= part.last; ++page) address_space.Set(page, part.arena);
+        UpdateDensePageTable(part.arena, part.preserved);
+    }
+    // A recorded draw may still reference a superseded handle: retired through the scheduler.
+    for (const auto* old : previous) {
+        scheduler.DeferOperation([old] { const_cast<Buffer*>(old)->buffer.Destroy(); });
+        BbStats::dense_arena_bytes.fetch_sub(old->SizeBytes(), std::memory_order_relaxed);
+        std::erase(dense_live, old);
+    }
+    u64 made = 0;
+    for (auto& part : parts) {
+        const u64 size = part.arena->SizeBytes();
+        made += size;
+        BbStats::dense_arenas_created.fetch_add(1, std::memory_order_relaxed);
+        BbStats::dense_arena_bytes.fetch_add(size, std::memory_order_relaxed);
+        part.arena->last_use_epoch = use_epoch;
+        dense_live.push_back(part.arena);
+        // An overlay holds no data where it covers shared memory: the tracker uploads it there.
+        ForEachSharedPart(part.arena->cpu_addr, size, [this](VAddr at, u64 bytes) {
+            memory_tracker->MarkRegionAsCpuModified(at, bytes);
+        });
+    }
+    static u64 splits = 0;
+    ++splits;
+    const u64 asked = (last_page - first_page + 1) << arena_page_bits;
+    if (splits <= 20 || splits % 100 == 0 || asked > limit) {
+        std::printf("Buffer arenas: split %llu: joined would be %llu MiB (limit %llu MiB); asked %llu MiB, "
+                    "%zu old -> %zu arenas, %llu MiB%s\n",
+                    static_cast<unsigned long long>(splits), static_cast<unsigned long long>(joined >> 20),
+                    static_cast<unsigned long long>(limit >> 20), static_cast<unsigned long long>(asked >> 20),
+                    previous.size(), parts.size(), static_cast<unsigned long long>(made >> 20),
+                    asked > limit ? " (the asked range alone is over the limit)" : "");
+        std::fflush(stdout);
+    }
+    return parts[0].arena;
 }
 
 // bbport: the game never unmaps its memory, and every range the GPU ever used kept a dense arena

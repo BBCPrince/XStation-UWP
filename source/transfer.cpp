@@ -207,6 +207,8 @@ void UploadPkg(SOCKET s, const std::wstring& relative, uint64_t length, const ch
     streamStatus.stored = 0;
     streamStatus.progress.done = streamStatus.progress.total = 0;
     streamStatus.progress.files = streamStatus.progress.filesTotal = 0;
+    streamStatus.progress.damagedBlocks = 0;
+    { std::lock_guard<std::mutex> l(streamStatus.progress.damagedLock); streamStatus.progress.damaged.clear(); }
     ++active;
     bool ok = true, complete = false;
     {
@@ -240,7 +242,7 @@ void UploadPkg(SOCKET s, const std::wstring& relative, uint64_t length, const ch
     const int phase = streamStatus.phase;
     {
         std::lock_guard<std::mutex> lock(convertedLock);
-        lastPkgMessage = ok ? (phase == 3 ? L"Converted " + id + (update ? L" (update)" : L"") : error) : error;
+        lastPkgMessage = ok ? (phase == 3 ? L"Converted " + id + (update ? L" (update)" : L"") + PkgDamagedText(streamStatus.progress) : error) : error;
         if (!ok) lastPkgError = error.empty() ? (complete ? L"The PKG couldn't be converted." : L"The upload stopped before the end. Check the Wi-Fi and send it again.") : error;
     }
     if (ok && phase == 3) {

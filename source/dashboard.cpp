@@ -2550,6 +2550,8 @@ struct DashApp : ApplicationT<DashApp> {
         converting = true;
         convertProgress.done = convertProgress.total = 0;
         convertProgress.files = convertProgress.filesTotal = 0;
+        convertProgress.damagedBlocks = 0;
+        { std::lock_guard<std::mutex> l(convertProgress.damagedLock); convertProgress.damaged.clear(); }
         copyArtReady = false;
         copySpeed = 0;
         speedBytes = 0;
@@ -2584,6 +2586,11 @@ struct DashApp : ApplicationT<DashApp> {
                     std::ofstream size(target + L"\\xstation-game.txt", std::ios::trunc | std::ios::binary);
                     size << convertProgress.total.load();
                 }
+                PkgDamagedSave(convertProgress, target);
+                {
+                    std::lock_guard<std::mutex> l(convertProgress.damagedLock);
+                    for (const auto& p : convertProgress.damaged) UsbLog(L"damaged (zeros written): " + FromUtf8(p));
+                }
                 const std::wstring id = target.substr(target.find_last_of(L'\\') + 1);
                 {
                     preparing = true;
@@ -2593,7 +2600,8 @@ struct DashApp : ApplicationT<DashApp> {
                     UsbLog(L"prepare " + id + L" (engine " + engine + L"): " + (prepared ? L"done" : perr) + L"\n" + FromUtf8(detail));
                     convertPrepared = prepared;
                     std::lock_guard<std::mutex> lock(copyLock);
-                    prepareResult = prepared ? L"It's prepared: mount it (Y) or copy it to the Xbox (A)." : L"It couldn't be prepared: " + perr;
+                    prepareResult = (prepared ? L"It's prepared: mount it (Y) or copy it to the Xbox (A)." : L"It couldn't be prepared: " + perr) +
+                                    PkgDamagedText(convertProgress);
                 }
                 const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
                 UsbLog(L"convert done: " + std::to_wstring(convertProgress.files.load()) + L" files, " + std::to_wstring(convertProgress.total.load()) +
