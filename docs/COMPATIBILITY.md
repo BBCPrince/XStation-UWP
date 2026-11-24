@@ -35,6 +35,23 @@ Use these game versions with the listed title IDs. Other updates and regions are
 - Warm caches improve repeat runs. For example, Bloodborne's cold cache-fill load briefly fell to 3–14 FPS, while the repeat cached load dipped to 42–47; gameplay in that measured scene remained 59–60.
 - These are short development measurements, not a cross-title benchmark. Some captures/profiling introduced hitches. No FPS or memory figure here guarantees stability throughout a game.
 
+## Bloodborne and the Potatoborne mod
+
+- **XStation does not include any game files or mods.** You supply your own game dump; nothing from a mod is in the
+  MSIX or in this repository.
+- The Bloodborne figures in the table above were recorded **November 7–13, 2026, without mods**.
+- From **November 22, 2026** the developer's test Xbox has had the
+  [Potatoborne](https://www.nexusmods.com/bloodborne/mods/387) performance mod (by Kyoski, v1.0) installed in the
+  game's files, so Bloodborne testing from that date on ran **with** it. The mod lowers texture resolution, removes
+  cloth physics and corpses, and cuts some map objects and effects; it lowered peak memory in the recorded tests.
+  Without it, expect higher memory use and possibly lower FPS.
+- Installing it is optional and done by you: copy the mod's files over the matching files in the prepared game's
+  `GameData109\dvdroot_ps4` folder (for example `DevelopmentFiles\XStation\Games\CUSA00900\GameData109\dvdroot_ps4`
+  on the Xbox), after keeping a backup of the files it replaces.
+- Known issue, under investigation: after dying or teleporting, some surfaces can show wrong colors (a glow, a purple
+  sheen, or a dark room) until the area loads again. It was seen with the mod installed; whether the mod plays a part
+  is not established.
+
 ## Test scope
 
 This summary uses recorded development tests from November 7–13, 2026, including earlier standalone title builds where noted. Raw logs, screenshots, game files and saves are not distributed.

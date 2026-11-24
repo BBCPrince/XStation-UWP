@@ -16,7 +16,7 @@ Recorded **Xbox Series X Developer Mode** results from earlier development binar
 
 | Game | Tested game version | Recorded FPS | Verified progress |
 | --- | --- | --- | --- |
-| Bloodborne | **1.09** | **58–60**, 540p, dynamic shadows off | Saved character, movement/menus, Hunter's Dream |
+| Bloodborne | **1.09** | **58–60**, 540p, dynamic shadows off (no mods) | Saved character, movement/menus, Hunter's Dream |
 | The Last of Us Remastered | **1.00** (base game) | **25–30** in recorded XStation checks; 30 cap | Menus and in-game saved checkpoints; chapter completion not established |
 | Uncharted 1: Drake's Fortune (Nathan Drake Collection) | **1.00** (base collection) | **30 capped**; **58–59 average uncapped** on early boat deck | Early jungle and boat-deck gameplay |
 | God of War (2018) | **1.35** | **16–18**, later standalone development build | Opening gameplay / axe-swing prompt; later trial not integrated into packaged engine |
@@ -24,6 +24,8 @@ Recorded **Xbox Series X Developer Mode** results from earlier development binar
 | Uncharted 2 / Uncharted 3 | Not verified | Not measured | Gameplay not verified |
 
 Use the listed game version and matching title ID from the [compatibility list](docs/COMPATIBILITY.md). Other updates or regions are unverified and may fail preparation. These are game versions, separate from XStation's own app version.
+
+**Bloodborne mod note:** XStation ships no game files and no mods. Since November 22, 2026 the developer's Bloodborne testing has used the [Potatoborne](https://www.nexusmods.com/bloodborne/mods/387) performance mod (by Kyoski), installed separately in the game's files; the FPS above were recorded earlier, without it. See [Bloodborne and the Potatoborne mod](docs/COMPATIBILITY.md#bloodborne-and-the-potatoborne-mod).
 
 These are scene-specific results, not whole-game FPS guarantees. TLOU's optional frame-generated output is separate from real game FPS. See the **[full compatibility list](docs/COMPATIBILITY.md)** for settings, test references, known limits and build differences.
 
