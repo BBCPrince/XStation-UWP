@@ -357,6 +357,8 @@ void ScanGames(const std::wstring& root, const std::wstring& package, const std:
             std::ifstream limit(local + L"\\Titles\\" + id + L"\\frame-limit.txt");
             int value = 0;
             if (limit >> value && value == 30) g.fps = 30;
+            // 2026-11-28: Bloodborne starts at 30 (its engine defaults' frame-limit.txt) until 60 is chosen.
+            else if (!limit.is_open() && id == L"CUSA00900") g.fps = 30;
         }
         if (HasFsrUpscale(id)) {
             std::ifstream upscale(local + L"\\Titles\\" + id + L"\\fsr-upscale.txt");
@@ -3032,7 +3034,13 @@ struct DashApp : ApplicationT<DashApp> {
         CreateDirectoryW((local + L"\\Titles").c_str(), nullptr);
         CreateDirectoryW(folder.c_str(), nullptr);
         // No file means 60 for every engine; Bloodborne's reads the file itself and knows only 30.
-        if (wanted == 30) {
+        // 2026-11-28: Bloodborne's engine defaults hold frame-limit.txt = 30 (copied at its first launch when there
+        // is no file), so its 60 is saved as "60" (uncapped to its engine) instead of deleting the file.
+        if (wanted == 60 && g.id == L"CUSA00900") {
+            std::ofstream limit(folder + L"\\frame-limit.txt", std::ios::trunc);
+            limit << 60;
+            if (!limit.flush()) { notice.Text(L"Couldn't save the FPS choice."); return; }
+        } else if (wanted == 30) {
             std::ofstream limit(folder + L"\\frame-limit.txt", std::ios::trunc);
             limit << 30;
             if (!limit.flush()) { notice.Text(L"Couldn't save the FPS choice."); return; }
