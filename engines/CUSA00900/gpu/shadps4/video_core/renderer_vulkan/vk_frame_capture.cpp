@@ -42,10 +42,9 @@ std::vector<std::string> pending_buffers;
 void AddBuffers(Entry& entry) {
     // Constants of full-screen passes (post-processing: camera matrices) and of the first draw
     // of each geometry pass.
-    if (entry.draws <= 4) {
-        for (auto& b : pending_buffers) {
-            entry.buffers.push_back(std::move(b));
-        }
+    // XStation 2026-11-21 (capture_all.py): every draw's constants.
+    for (auto& b : pending_buffers) {
+        entry.buffers.push_back(std::move(b));
     }
     pending_buffers.clear();
 }
@@ -222,6 +221,13 @@ void FrameCapture::Draw(u64 vs_hash, u64 ps_hash, u32 num_indices, u32 num_insta
     e.indices += u64(num_indices) * std::max(num_instances, 1u);
     AddShader(e, vs_hash);
     AddShader(e, ps_hash);
+    // XStation 2026-11-21 (capture_all.py): one line per draw with what it samples.
+    std::string line = std::format("  draw {} vs {:016x} ps {:016x} indices {} instances {}", e.draws,
+                                   vs_hash, ps_hash, num_indices, num_instances);
+    for (const auto& [t, storage] : pending_sampled) {
+        line += std::format("\n    {} {}", storage ? "writes" : "tex", Describe(t));
+    }
+    e.buffers.push_back(std::move(line));
     AddSampled(e);
     AddBuffers(e);
 }

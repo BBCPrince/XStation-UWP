@@ -138,7 +138,29 @@ static int translate(const char *guest,char *out,size_t size) {
     int result=0;
     if (!m) result=ENOENT;
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
+    /* XStation 2026-11-24 (lite_overlay.py): files of <app0 root>-lite win over the game's own */
+    char lite_root[600]; lite_root[0]=0; size_t lite_skip=0;
+    if (!result && m && (!strcmp(m->guest,"/app0") || !strcmp(m->guest,"/hostapp"))) {
+        snprintf(lite_root,sizeof(lite_root),"%s-lite",m->host);
+        lite_skip=strlen(m->host);
+    }
     pthread_mutex_unlock(&lock);
+    if (lite_root[0]) {
+        static int lite_state=-1; /* -1 unknown, 0 off, 1 on */
+        if (lite_state<0) {
+            const char *env=getenv("BB_LITE");
+            HostStat dir;
+            lite_state=!(env && env[0]=='0') && !host_stat(lite_root,&dir);
+            fprintf(stderr,lite_state ? "Runtime: lite pack %s (BB_LITE)\n" : "Runtime: no lite pack (%s)\n",lite_root);
+        }
+        if (lite_state==1) {
+            char candidate[1024];
+            HostStat file;
+            if ((size_t)snprintf(candidate,sizeof(candidate),"%s%s",lite_root,out+lite_skip)<sizeof(candidate) &&
+                !host_stat(candidate,&file))
+                snprintf(out,size,"%s",candidate);
+        }
+    }
     if (!result && strstr(out,"/dvdroot_ps4/")) {
         const char *language=getenv("BB_LANGUAGE");
         if (language && !strcmp(language,"17")) {

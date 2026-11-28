@@ -67,6 +67,8 @@ No game data is assembled by these commands. Bloodborne on-console preparation a
 
 ## Validation and licensing
 
+Version 0.1.4.80 includes Bloodborne runtime source updates for layered compressed-texture allocation, concurrent memory writes, cached paging read-ahead, and shader-cache preparation. The supplied release DLL has SHA-256 `797146f03955cf5bce307751d28f0944a5d42646b14f4f50c9bf2d4e453ad050`. Fresh source builds do not claim byte-for-byte equivalence with the release toolchain.
+
 `engines/manifest.json` records the older installed binary hashes for provenance. Fresh builds use the exported sources and a new build recipe, without private PGO profiles, so byte equality or identical performance with those binaries is not claimed. Build success is separate from full-game compatibility. Nothing is deployed to Xbox automatically.
 
 Upstream source notices remain in the snapshots, including bbport/shadPS4, FSR/AMD, ImGui, LibAtrac9, miniz and other components. Mesa retains its own licenses; local changes are identified by the source override manifests. The dynamic toolchain dependencies also have their own terms and corresponding-source obligations where applicable. Creating this private source repository is not a certification of a future binary release.

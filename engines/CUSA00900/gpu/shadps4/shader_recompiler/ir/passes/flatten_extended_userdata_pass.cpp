@@ -25,6 +25,9 @@
 #include "shader_recompiler/ir/srt_gvn_table.h"
 #include "shader_recompiler/ir/value.h"
 
+extern thread_local bool g_shader_prebuild_test;
+extern thread_local const std::vector<unsigned>* g_shader_fake_flat;
+
 #ifdef ARCH_X86_64
 
 using namespace Xbyak::util;
@@ -687,10 +690,27 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
 }
 
 static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
-    Xbyak::CodeGenerator& c = g_srt_codegen;
+    // XStation 2026-11-16 (TLOU 2026-11-09): translations with no game build their walker in a scratch
+    // buffer; a later load from the cache registers it in the real one.
+    static std::mutex scratch_create;
+    static Xbyak::CodeGenerator* scratch = nullptr;
+    if (g_shader_prebuild_test) {
+        std::scoped_lock create{scratch_create};
+        if (!scratch) {
+            scratch = new Xbyak::CodeGenerator(1_MB);
+        }
+    }
+    thread_local Xbyak::CodeGenerator* own_scratch = nullptr;
+    if (g_shader_prebuild_test && !own_scratch) {
+        own_scratch = new Xbyak::CodeGenerator(1_MB);
+    }
+    Xbyak::CodeGenerator& c = g_shader_prebuild_test ? *own_scratch : g_srt_codegen;
 
     if (pass_info.srt_roots.empty()) {
         return;
+    }
+    if (g_shader_prebuild_test) {
+        c.reset();
     }
 
     // Register the signal handler for SRT walker, if not already registered
@@ -709,6 +729,13 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
 
     info.srt_info.walker_func_size =
         c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
+    if (g_shader_prebuild_test) {
+        // A copy for this translation's Info; RefreshFlatBuf must not run it.
+        thread_local std::vector<u8> walker_copy;
+        const auto* code = reinterpret_cast<const u8*>(info.srt_info.walker_func);
+        walker_copy.assign(code, code + info.srt_info.walker_func_size);
+        info.srt_info.walker_func = reinterpret_cast<PFN_SrtWalker>(walker_copy.data());
+    }
 
     if (EmulatorSettings.IsDumpShaders()) {
         DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),
@@ -902,7 +929,17 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         SetFlatbufOffset(readconst, GetFlatbufOffset(original));
     }
 
-    program.info.RefreshFlatBuf();
+    if (g_shader_prebuild_test) {
+        // No tables to walk: the recorded flat buffer, else nulls.
+        auto& flat = program.info.flattened_ud_buf;
+        flat.assign(program.info.srt_info.flattened_bufsize_dw, 0);
+        std::copy_n(program.info.user_data.begin(), std::min(flat.size(), program.info.user_data.size()), flat.begin());
+        if (g_shader_fake_flat) {
+            std::copy_n(g_shader_fake_flat->begin(), std::min(flat.size(), g_shader_fake_flat->size()), flat.begin());
+        }
+    } else {
+        program.info.RefreshFlatBuf();
+    }
 }
 
 } // namespace Shader::Optimization

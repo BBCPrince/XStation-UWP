@@ -30,6 +30,20 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+#include "bbport_overlay.h"
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <miniz.h>
+#include <windows.h>
+#include "common/elf_info.h"
+#include "common/thread.h"
+#include "common/serdes.h"
+
+extern thread_local bool g_shader_prebuild_test;
+extern thread_local const std::vector<unsigned>* g_shader_fake_flat;
+extern thread_local const void* g_shader_fake_fetch;
+
 namespace Vulkan {
 
 using Shader::HwStage;
@@ -285,6 +299,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     return info;
 }
 
+bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
+                    Shader::StageSpecialization& spec, size_t& perm_idx);
+#include "vk_recipe_cache.inc"
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -361,6 +380,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    // XStation 2026-11-16: a first start with a recipe rebuilds the cache before the warm-up.
+    RecipeColdStart(instance, profile);
     // Preloading constructs graphics/compute pipelines using this handle.
     WarmUp();
 }
@@ -880,6 +901,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    BbOverlay::ShaderBuilt(); // "Building shaders" notice
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");

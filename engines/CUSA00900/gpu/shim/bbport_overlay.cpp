@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
+#include <cstdlib>
 #include "bbport_overlay.h"
 
 #include <atomic>
@@ -71,6 +73,50 @@ float base_scale = 1.0f;
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+
+// "Building shaders" notice (from The Last of Us, 2026-11-09; added here 2026-11-15): shown while shaders are
+// translated and for a moment after. BB_SHADER_NOTICE=0 turns it off.
+std::atomic<std::uint32_t> shaders_burst{0}; ///< shaders since the notice came up
+std::atomic<std::int64_t> shader_last_ms{-100000};
+constexpr std::int64_t NoticeHoldMs = 1500;
+
+std::int64_t NoticeNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool NoticeEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_SHADER_NOTICE");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+bool NoticeActive() {
+    return NoticeEnabled() && NoticeNowMs() - shader_last_ms.load(std::memory_order_relaxed) < NoticeHoldMs;
+}
+
+void ShaderNotice() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 24.0f * base_scale;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + pad,
+                                   viewport->WorkPos.y + viewport->WorkSize.y - pad),
+                            ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("##shaders", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    const std::uint32_t count = shaders_burst.load(std::memory_order_relaxed);
+    if (count > 0) {
+        ImGui::Text("Building shaders (%u)", count);
+    } else {
+        ImGui::TextUnformatted("Building shaders");
+    }
+    ImGui::End();
+}
 
 void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
@@ -651,7 +697,12 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps);
+    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps || NoticeActive());
+}
+
+void ShaderBuilt() {
+    shaders_burst.fetch_add(1, std::memory_order_relaxed);
+    shader_last_ms.store(NoticeNowMs(), std::memory_order_relaxed);
 }
 
 bool CapturesInput() {
@@ -663,6 +714,14 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_active = active;
     text_entry_prompt = prompt;
     text_entry_text = text;
+}
+
+/* present_stats.py 2026-11-27: the stats part of Render every frame, drawing nothing */
+static bool stats_only_call;
+void PresentStats(vk::Extent2D extent) {
+    stats_only_call = true;
+    Render(vk::CommandBuffer{}, vk::ImageView{}, extent);
+    stats_only_call = false;
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
@@ -788,7 +847,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
-    if (!Visible()) {
+    if (stats_only_call || !Visible()) {
         return;
     }
     std::scoped_lock lock{imgui_mutex};
@@ -814,6 +873,13 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (text_entry_active) {
         TextEntryBox();
+    }
+    if (NoticeActive()) {
+        if (!menu_open) {
+            ShaderNotice();
+        }
+    } else {
+        shaders_burst.store(0, std::memory_order_relaxed); // the next burst counts from 0
     }
     ImGui::Render();
 

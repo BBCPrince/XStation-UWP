@@ -6,6 +6,9 @@
 #include <unordered_set>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <memory>
+#include <vector>
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -335,10 +338,13 @@ void Runtime::CaptureSampledImage(VideoCore::Image* image, u64 shader_hash, u32 
     // original block bytes too, keeping this opt-in diagnostic outside rendering.
     const auto format = image->info.pixel_format;
     const bool bc6 = format == vk::Format::eBc6HUfloatBlock || format == vk::Format::eBc6HSfloatBlock;
-    if ((!bc6 && (image->info.resources.levels != 1 || image->info.resources.layers != 1)) ||
+    // XStation 2026-11-21 (capture_bc.py): every BC format is dumped like BC6H.
+    const bool bc = static_cast<int>(format) >= static_cast<int>(vk::Format::eBc1RgbUnormBlock) &&
+                    static_cast<int>(format) <= static_cast<int>(vk::Format::eBc7SrgbBlock);
+    if ((!bc && (image->info.resources.levels != 1 || image->info.resources.layers != 1)) ||
         image->info.size.depth != 1 || image->info.num_samples != 1 || image->info.props.is_depth ||
         !(image->usage_flags & vk::ImageUsageFlagBits::eTransferSrc)) return;
-    if (!bc6 && format != vk::Format::eB10G11R11UfloatPack32 &&
+    if (!bc && format != vk::Format::eB10G11R11UfloatPack32 &&
         format != vk::Format::eR16G16B16A16Sfloat &&
         format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eR8G8B8A8Srgb &&
         format != vk::Format::eR32G32B32A32Sfloat) return;
@@ -349,15 +355,16 @@ void Runtime::CaptureSampledImage(VideoCore::Image* image, u64 shader_hash, u32 
     for (u32 mip = 0; mip < image->info.resources.levels; ++mip) {
         const u32 width = std::max(1u, image->info.size.width >> mip);
         const u32 height = std::max(1u, image->info.size.height >> mip);
-        const u32 row = bc6 ? ((width + 3) / 4) * 4 : width;
-        const u32 rows = bc6 ? ((height + 3) / 4) * 4 : height;
+        const u32 row = bc ? ((width + 3) / 4) * 4 : width;
+        const u32 rows = bc ? ((height + 3) / 4) * 4 : height;
         copies.push_back(vk::BufferImageCopy{
             .bufferOffset = bytes, .bufferRowLength = row, .bufferImageHeight = rows,
             .imageSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, image->info.resources.layers},
             .imageExtent = {width, height, 1}});
-        bytes += u64(row) * rows * vk::blockSize(format) * image->info.resources.layers / (bc6 ? 16 : 1);
+        bytes += u64(row) * rows * vk::blockSize(format) * image->info.resources.layers / (bc ? 16 : 1);
     }
-    if (!bytes || captured.contains(image->image_uid) || captured_bytes + bytes > 256_MB) return;
+    if (!bytes || captured.contains(image->image_uid) ||
+        captured_bytes + bytes + image->info.guest_size > 768_MB) return;
     // Vulkan cannot transition back to Undefined. Skip partially initialized
     // resources instead of changing their contents or inventing a prior layout.
     if (image->backing->subresource_states.empty()) {
@@ -366,7 +373,10 @@ void Runtime::CaptureSampledImage(VideoCore::Image* image, u64 shader_hash, u32 
         for (const auto& state : image->backing->subresource_states)
             if (state.layout == vk::ImageLayout::eUndefined) return;
     }
-    captured.insert(image->image_uid); captured_bytes += bytes;
+    captured.insert(image->image_uid); captured_bytes += bytes + image->info.guest_size;
+    // The guest bytes now (texture data as the game left it), for comparing with the GPU copy.
+    auto guest = std::make_shared<std::vector<u8>>(image->info.guest_size);
+    std::memcpy(guest->data(), reinterpret_cast<const void*>(image->info.guest_address), guest->size());
     // Texture binding may have queued the attachment->shader-read transition.
     // Flush it separately: two transitions of one image in a single dependency
     // command do not establish ordering between those transitions.
@@ -391,9 +401,13 @@ void Runtime::CaptureSampledImage(VideoCore::Image* image, u64 shader_hash, u32 
     const auto path = fmt::format("{}/{:03}_{:016x}_{:016x}_{}_{}x{}_{}{}", directory,
         captured.size(), image->info.guest_address, shader_hash, slot,
         image->info.size.width, image->info.size.height, vk::to_string(format),
-        bc6 ? fmt::format("_m{}_a{}.bc6", image->info.resources.levels, image->info.resources.layers) : ".raw");
-    scheduler.DeferPriorityOperation([readback = std::move(readback), bytes, path] {
+        bc ? fmt::format("_m{}_a{}.{}", image->info.resources.levels, image->info.resources.layers,
+                         bc6 ? "bc6" : "bc") : ".raw");
+    scheduler.DeferPriorityOperation([readback = std::move(readback), bytes, path, guest] {
         readback->Invalidate(0, bytes);
+        if (FILE* file = std::fopen((path + ".guest").c_str(), "wb")) {
+            std::fwrite(guest->data(), 1, guest->size(), file); std::fclose(file);
+        }
         if (FILE* file = std::fopen(path.c_str(), "wb")) {
             std::fwrite(readback->mapped_data.data(), 1, bytes, file); std::fclose(file);
             std::printf("Lighting image capture: %s (%llu bytes)\n", path.c_str(), (unsigned long long)bytes);

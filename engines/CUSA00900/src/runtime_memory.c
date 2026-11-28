@@ -663,7 +663,15 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
     return 0;
 }
 static int host_unmap(uintptr_t address, uint64_t size) { carve_host(address,address+size); return 0; }
+static SRWLOCK private_protect_lock; /* private_write.py */
+static int host_protect_locked(uintptr_t address, uint64_t size, int prot);
 static int host_protect(uintptr_t address, uint64_t size, int prot) {
+    AcquireSRWLockExclusive(&private_protect_lock);
+    const int result=host_protect_locked(address,size,prot);
+    ReleaseSRWLockExclusive(&private_protect_lock);
+    return result;
+}
+static int host_protect_locked(uintptr_t address, uint64_t size, int prot) {
     DWORD protect=win_prot(prot), old;
     uintptr_t end=address+size;
     for (size_t i=region_index(address); i<region_count && regions[i].start<end; ++i) {
@@ -848,7 +856,9 @@ static void host_discard(uint64_t phys, uint64_t size) {
  * "events=0" (no event ring), "balloon=MB" (test: commit that much at start). */
 static char pager_settings[512];
 static int pager_trace_on;
-static ULONGLONG pager_calm_dwell_ms=30000;
+static ULONGLONG pager_calm_dwell_ms=60000; /* pager_tune.py 2026-11-27: 60 s (old 30 s) */
+static int pager_old; /* BB_PAGER_OLD=1 / pager.txt old=1: the pre-2026-11-27 thresholds */
+static int pager_ahead=8, pager_cache_mib=32; /* pager_cache_ahead.py 2026-11-27: pager.txt ahead=N cache=MiB */
 static long pager_setting(const char *key, long fallback) {
     if (!strcmp(key,"off")) return pager_settings[0]=='0';
     const char *at=strstr(pager_settings,key);
@@ -857,9 +867,13 @@ static long pager_setting(const char *key, long fallback) {
 static void pager_read_settings(void) {
     FILE *f=fopen("pager.txt","rb");
     if (f) { const size_t n=fread(pager_settings,1,sizeof(pager_settings)-1,f); pager_settings[n]=0; fclose(f); }
-    const char *trace=getenv("BB_PAGER_TRACE"), *dwell=getenv("BB_PAGER_DWELL_S");
+    const char *trace=getenv("BB_PAGER_TRACE"), *dwell=getenv("BB_PAGER_DWELL_S"), *old=getenv("BB_PAGER_OLD");
+    pager_old=pager_setting("old=",old ? strtol(old,NULL,10) : 1)==1; /* pager_public_defaults.py: old by default */
+    if (pager_old) pager_calm_dwell_ms=30000;
     pager_trace_on=pager_setting("trace=",trace ? strtol(trace,NULL,10) : 0)==1;
     pager_events_on=pager_setting("events=",1)!=0;
+    pager_ahead=(int)pager_setting("ahead=",8); if (pager_ahead<0) pager_ahead=0; if (pager_ahead>32) pager_ahead=32;
+    pager_cache_mib=(int)pager_setting("cache=",32); if (pager_cache_mib<1) pager_ahead=0; if (pager_cache_mib>256) pager_cache_mib=256;
     const long s=pager_setting("dwell=",dwell ? strtol(dwell,NULL,10) : 0);
     if (s>0) pager_calm_dwell_ms=(ULONGLONG)s*1000;
     if (f) { for (char *c=pager_settings;*c;++c) if (*c=='\r' || *c=='\n') *c=' '; printf("Pager: pager.txt \"%s\"\n",pager_settings); }
@@ -908,7 +922,10 @@ static volatile int pager_urgent; /* pager_thread: near the limit, the cooldown 
  * PAGER_CALM_DWELL_MS (30 s; ~84% of private memory is untouched for 60 s) unless the app is
  * within PAGER_RUSH_MB of the limit (then PAGER_DWELL_MS); and a chunk that came back or was
  * touched while swept is left alone for PAGER_COOLDOWN_S. BB_PAGER_DWELL_S overrides the 30 s. */
-#define PAGER_HIGH_BELOW_LIMIT_MB 1100
+#define PAGER_HIGH_BELOW_LIMIT_MB 1100 /* pager_tune.py 2026-11-27: kept (850 tried: more slow seconds) */
+#define PAGER_OLD_HIGH_BELOW_LIMIT_MB 1100
+#define PAGER_TUNED_FAST_MB 750
+#define PAGER_TUNED_FAST_DWELL_MS 10000
 #define PAGER_CALM_DWELL_MS 30000
 #define PAGER_COOLDOWN_S 120
 #define PAGER_URGENT_COOLDOWN_S 30
@@ -1014,6 +1031,28 @@ static void pager_set_sum(uint32_t slot, uint64_t sum) {
     }
     pager_sums[slot]=sum;
 }
+/* pager_cache_ahead.py 2026-11-27: chunks read ahead into RAM the game never sees. An entry is valid with
+ * chunk + slot + checksum; it is made invalid (under pager_lock) before its buffer is written again. */
+typedef struct { uintptr_t chunk; uint32_t slot; int valid; } PagerCacheEntry;
+static PagerCacheEntry *pager_cache; static unsigned char *pager_cache_data; static unsigned pager_cache_n, pager_cache_next;
+static volatile LONG64 pager_cache_hits, pager_cache_filled, pager_cache_bad, pager_read_us, pager_total_us, pager_timed;
+static double pager_qpc_us;
+static uint64_t pager_qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart; }
+static int pager_cache_find(uintptr_t chunk, uint32_t slot) { /* pager_lock held */
+    for (unsigned i=0;i<pager_cache_n;++i) if (pager_cache[i].valid && pager_cache[i].chunk==chunk && pager_cache[i].slot==slot) return (int)i;
+    return -1;
+}
+/* pager_lock held: the cached copy of the chunk into buf (entry used up), 1 when it matched its checksum */
+static int pager_cache_take(uintptr_t chunk, uint32_t slot, unsigned char *buf) {
+    if (!pager_cache_n) return 0;
+    const int i=pager_cache_find(chunk,slot);
+    if (i<0) return 0;
+    pager_cache[i].valid=0;
+    memcpy(buf,pager_cache_data+(size_t)i*PRIVATE_CHUNK,PRIVATE_CHUNK);
+    if (slot>=pager_sums_capacity || !pager_sums[slot] || pager_checksum(buf)!=pager_sums[slot]) { _InterlockedExchangeAdd64(&pager_cache_bad,1); return 0; }
+    _InterlockedExchangeAdd64(&pager_cache_hits,1);
+    return 1;
+}
 /* A chunk in the file comes back as a view of a section of its own, filled first. pager_lock held. */
 /* Private page-in (2026-10-31 crash): a chunk used to come back as a view of a 64 KiB section of
  * its own. Section views count as shared commit, which the Xbox caps near 0.9 GiB (probe: views
@@ -1049,7 +1088,11 @@ static int pager_page_in_private(uintptr_t chunk, PagerEntry *e, ULONGLONG began
     void *at=NULL;
     for (int attempt=0;;++attempt) {
         if (!filled) {
-            if (!pager_slot_io(e->slot,fill,0)) win_fail("pager: reading a chunk back from the file",chunk,PRIVATE_CHUNK);
+            if (!pager_cache_take(chunk,e->slot,fill)) {
+                const uint64_t r0=pager_qpc();
+                if (!pager_slot_io(e->slot,fill,0)) win_fail("pager: reading a chunk back from the file",chunk,PRIVATE_CHUNK);
+                if (pager_qpc_us>0) _InterlockedExchangeAdd64(&pager_read_us,(LONG64)((pager_qpc()-r0)/pager_qpc_us));
+            }
             if (e->slot<pager_sums_capacity && pager_sums[e->slot] && pager_checksum(fill)!=pager_sums[e->slot]) {
                 if (_InterlockedExchangeAdd64(&pager_corrupt,1)<16) {
                     fprintf(stderr,"Pager: the chunk at %p came back different from what went out (slot %u)\n",(void*)chunk,e->slot);
@@ -1058,13 +1101,17 @@ static int pager_page_in_private(uintptr_t chunk, PagerEntry *e, ULONGLONG began
             }
             filled=1;
         }
+        /* No access (2026-11-16, as TLOU 2026-11-15), not guard pages: a guard stops only the first
+         * touch of a page. Once one thread had taken a page's guard and waited, others read that page
+         * as zeros until the copy reached it ("differs from its file copy after the page-in"). A
+         * no-access page faults every touch (pager_fault waits for pager_lock). */
         at=no_guard ? NULL : VirtualAlloc2(NULL,(void*)chunk,PRIVATE_CHUNK,MEM_RESERVE|MEM_COMMIT|MEM_REPLACE_PLACEHOLDER,
-                                           PAGE_READWRITE|PAGE_GUARD,NULL,0);
+                                           PAGE_NOACCESS,NULL,0);
         DWORD error=at ? 0 : GetLastError();
         const int at_limit=error==ERROR_COMMITMENT_LIMIT || error==ERROR_NOT_ENOUGH_MEMORY || error==ERROR_WORKING_SET_QUOTA;
         if (!at && !no_guard && !at_limit) {
             no_guard=1;
-            fprintf(stderr,"Pager: guarded private memory was refused (error %lu): chunks come back read-write, then protected\n",error);
+            fprintf(stderr,"Pager: no-access private memory was refused (error %lu): chunks come back read-write, then protected\n",error);
             fflush(stderr);
         }
         if (!at && no_guard) {
@@ -1084,17 +1131,19 @@ static int pager_page_in_private(uintptr_t chunk, PagerEntry *e, ULONGLONG began
         if (!made && attempt>=2) win_fail("pager: committing a chunk coming back (no room)",chunk,PRIVATE_CHUNK);
         filled=0; /* another page-in may have used the fill buffer meanwhile */
     }
+    /* Page by page (2026-11-16): each page is opened right before its 4 KiB copy, so a page shows zeros
+     * to another thread for about a microsecond, not until the copy of the whole chunk gets there.
+     * Read-only pages (GPU write watches) are opened read-write for their copy, then closed. */
     pager_filling=1;
-    for (int p=0;p<16;) {
+    for (int p=0;p<16;++p) {
         const uint8_t code=e->prot[p] ? e->prot[p] : e->init;
-        int q=p+1;
-        while (q<16 && (e->prot[q] ? e->prot[q] : e->init)==code) ++q;
-        memcpy((void*)(chunk+(uintptr_t)p*4096),fill+(size_t)p*4096,(size_t)(q-p)*4096);
+        unsigned char *page=(unsigned char*)(chunk+(uintptr_t)p*4096);
         DWORD old;
-        if ((code==1 || !no_guard) &&
-            !VirtualProtect((void*)(chunk+(uintptr_t)p*4096),(SIZE_T)(q-p)*4096,code==1 ? PAGE_READONLY : PAGE_READWRITE,&old))
+        if (!no_guard && !VirtualProtect(page,4096,PAGE_READWRITE,&old))
+            win_fail("pager: opening a page that came back",(uintptr_t)page,4096);
+        memcpy(page,fill+(size_t)p*4096,4096);
+        if (code==1 && !VirtualProtect(page,4096,PAGE_READONLY,&old))
             win_fail("pager: protecting a chunk that came back",chunk,PRIVATE_CHUNK);
-        p=q;
     }
     pager_filling=0;
     /* Checked (2026-11-03, Xbox crash: a guest read a stale pointer out of a chunk paged in 6 ms
@@ -1121,13 +1170,58 @@ static int pager_page_in_private(uintptr_t chunk, PagerEntry *e, ULONGLONG began
 }
 /* 1 when the chunk is back; 0: see pager_page_in_private. pager_lock held. */
 static int pager_page_in(uintptr_t chunk, PagerEntry *e) {
-    return pager_page_in_private(chunk,e,GetTickCount64());
+    const uint64_t t0=pager_qpc();
+    const int r=pager_page_in_private(chunk,e,GetTickCount64());
+    if (pager_qpc_us>0) { _InterlockedExchangeAdd64(&pager_total_us,(LONG64)((pager_qpc()-t0)/pager_qpc_us)); _InterlockedExchangeAdd64(&pager_timed,1); }
+    return r;
 }
 /* Page-ins run here for faults and for bring-backs on small stacks: the asking thread only waits. */
 typedef struct PageInRequest { uintptr_t chunk; int done, result; struct PageInRequest *next; } PageInRequest;
 static pthread_mutex_t pagein_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pagein_wake=PTHREAD_COND_INITIALIZER, pagein_done=PTHREAD_COND_INITIALIZER;
 static PageInRequest *pagein_queue;
+/* pager_cache_ahead.py: the evicted neighbours of a chunk a fault just brought back, read into the cache on the
+ * helper after the waiting thread is released (the game's memory is not touched). */
+static uint64_t pager_app_usage(void);
+static void pager_cache_ahead(uintptr_t asked) {
+    if (!pager_cache) {
+        const unsigned n=(unsigned)pager_cache_mib*16u;
+        pager_cache_data=VirtualAlloc(NULL,(SIZE_T)n*PRIVATE_CHUNK,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        pager_cache=pager_cache_data ? calloc(n,sizeof(*pager_cache)) : NULL;
+        if (!pager_cache) { pager_ahead=0; fprintf(stderr,"Pager: no read-ahead cache (%d MiB refused)\n",pager_cache_mib); fflush(stderr); return; }
+        pager_take(); pager_cache_n=n; pager_give();
+    }
+    for (int dir=1; dir>=-1; dir-=2) {
+        const int n=dir>0 ? pager_ahead : pager_ahead/4;
+        for (int k=1; k<=n; ++k) {
+            if (__atomic_load_n(&pagein_queue,__ATOMIC_ACQUIRE)) return; /* a thread waits: it goes first */
+            if (pager_app_usage()+((uint64_t)PAGER_URGENT_MB<<20)>pager_limit) return;
+            const uintptr_t chunk=dir>0 ? asked+(uintptr_t)k*PRIVATE_CHUNK : asked-(uintptr_t)k*PRIVATE_CHUNK;
+            pager_take();
+            PagerEntry *e=pager_entry(chunk,0);
+            const int evicted=e && e->state==PG_EVICTED && !e->pinned;
+            const uint32_t slot=evicted ? e->slot : 0;
+            int idx=-1;
+            if (evicted && pager_cache_find(chunk,slot)<0 && slot<pager_sums_capacity && pager_sums[slot]) {
+                idx=(int)(pager_cache_next++%pager_cache_n);
+                pager_cache[idx].valid=0; /* its buffer is written next, outside the lock */
+            }
+            pager_give();
+            if (!evicted) break;
+            if (idx<0) continue;
+            unsigned char *buf=pager_cache_data+(size_t)idx*PRIVATE_CHUNK;
+            if (!pager_slot_io(slot,buf,0)) continue;
+            const uint64_t sum=pager_checksum(buf);
+            pager_take();
+            e=pager_entry(chunk,0);
+            if (e && e->state==PG_EVICTED && e->slot==slot && slot<pager_sums_capacity && pager_sums[slot]==sum) {
+                pager_cache[idx].chunk=chunk; pager_cache[idx].slot=slot; pager_cache[idx].valid=1;
+                _InterlockedExchangeAdd64(&pager_cache_filled,1);
+            }
+            pager_give();
+        }
+    }
+}
 static DWORD WINAPI pagein_thread(void *unused) {
     (void)unused;
     for (;;) {
@@ -1139,14 +1233,18 @@ static DWORD WINAPI pagein_thread(void *unused) {
         pager_take();
         PagerEntry *e=pager_entry(request->chunk,0);
         int result=1;
-        if (e && e->state==PG_EVICTED) result=pager_page_in(request->chunk,e);
+        const int asked_evicted=e && e->state==PG_EVICTED; /* pager_cache_ahead.py */
+        if (asked_evicted) result=pager_page_in(request->chunk,e);
         else if (e && e->state) { pager_restore(request->chunk,e); _InterlockedExchangeAdd64(&pager_touched,1); }
         pager_give();
+        const uintptr_t asked=request->chunk; /* the request lives on the waiter's stack */
+        const int was_evicted=result && asked_evicted;
         pthread_mutex_lock(&pagein_mutex);
         request->result=result;
         request->done=1;
         pthread_cond_broadcast(&pagein_done);
         pthread_mutex_unlock(&pagein_mutex);
+        if (was_evicted && pager_ahead>0) pager_cache_ahead(asked);
     }
 }
 /* A chunk back by the helper (pager_lock not held). When its commit hit the memory limit and the
@@ -1521,12 +1619,14 @@ static DWORD WINAPI pager_thread(void *unused) {
                 fprintf(stderr,"Pager memory t=%llu: commit left %llu of %llu MiB, physical free %llu of %llu MiB, app %llu MiB\n",
                         (unsigned long long)(now/1000),(unsigned long long)(ms.ullAvailPageFile>>20),(unsigned long long)(ms.ullTotalPageFile>>20),
                         (unsigned long long)(ms.ullAvailPhys>>20),(unsigned long long)(ms.ullTotalPhys>>20),(unsigned long long)(usage>>20));
-            fprintf(stderr,"Pager trace t=%llu: app %llu MiB, file %lld, out %lld, back %lld, aborted %lld, swept %lld, touched %lld, let go %lld, views %lld, failed %lld, queue %zu, fiber stacks pinned %lld (%lld KiB), came back different %lld, guard waits %lld, read retries %lld, host pins %lld, fill diffs %lld\n",
+            fprintf(stderr,"Pager trace t=%llu: app %llu MiB, file %lld, out %lld, back %lld, aborted %lld, swept %lld, touched %lld, let go %lld, views %lld, failed %lld, queue %zu, fiber stacks pinned %lld (%lld KiB), came back different %lld, guard waits %lld, read retries %lld, host pins %lld, fill diffs %lld, cache filled %lld hits %lld bad %lld, page-in %lld us (disk read %lld us) over %lld\n",
                     (unsigned long long)(now/1000),(unsigned long long)(usage>>20),(long long)pager_in_file,(long long)pager_evicted,
                     (long long)pager_page_ins,(long long)pager_aborted,(long long)pager_swept,(long long)pager_touched,
                     (long long)pager_released,(long long)pager_views,(long long)pager_failed,(head+QUEUE-tail)%QUEUE,
                     (long long)pager_stacks,(long long)(pager_stack_bytes>>10),(long long)pager_corrupt,(long long)pager_guard_waits,
-                    (long long)pager_io_retries,(long long)pager_host_pins,(long long)pager_fill_diffs);
+                    (long long)pager_io_retries,(long long)pager_host_pins,(long long)pager_fill_diffs,
+                    (long long)pager_cache_filled,(long long)pager_cache_hits,(long long)pager_cache_bad,
+                    (long long)pager_total_us,(long long)pager_read_us,(long long)pager_timed);
             fflush(stderr);
         }
         {
@@ -1578,20 +1678,25 @@ static DWORD WINAPI pager_thread(void *unused) {
         const int thrashing=in10>=200 && in10*2>=out10;
         const int urgent=usage+((uint64_t)PAGER_URGENT_MB<<20)>pager_limit && !thrashing;
         const int climbing=usage>pager_low && usage-lowest>=((uint64_t)PAGER_CLIMB_MB<<20);
-        const int rush=urgent || thrashing || climbing || usage+((uint64_t)PAGER_FAST_MB<<20)>pager_limit;
+        /* pager_tune.py 2026-11-27: thrashing made the pager fast (5 s dwell), evicting the working set
+         * harder; now it slows down (dwell doubled, calm pace) unless the app is near the limit */
+        const int near_limit=usage+((uint64_t)(pager_old ? PAGER_FAST_MB : PAGER_TUNED_FAST_MB)<<20)>pager_limit;
+        const int rush=pager_old ? (urgent || thrashing || climbing || near_limit) : (urgent || near_limit || (climbing && !thrashing));
+        const int slow=!pager_old && thrashing && !rush;
         pager_urgent=urgent;
         static int last_level=0;
-        const int level=urgent ? 2 : thrashing ? 3 : rush ? 1 : 0;
+        const int level=urgent ? 2 : slow ? 4 : thrashing ? 3 : rush ? 1 : 0;
         if (level!=last_level) {
             printf("Pager: pressure %s (app %llu MiB, +%llu MiB in 10 s; 10 s: %lld out, %lld back)\n",
-                   level==2 ? "urgent" : level==3 ? "fast (thrashing)" : level ? "fast" : "calm",
+                   level==2 ? "urgent" : level==4 ? "slow (thrashing)" : level==3 ? "fast (thrashing)" : level ? "fast" : "calm",
                    (unsigned long long)(usage>>20),(unsigned long long)((usage-lowest)>>20),(long long)out10,(long long)in10);
             fflush(stdout);
             last_level=level;
         }
         /* 1. swept chunks a dwell ago: out while above the low mark, else let go */
         const unsigned out_cap=urgent ? 512 : rush ? 256 : PAGER_OUT_PER_LOOP;
-        const ULONGLONG dwell=urgent ? 3000 : rush ? PAGER_DWELL_MS : pager_calm_dwell_ms;
+        const ULONGLONG dwell=urgent ? 3000 : rush ? (pager_old ? PAGER_DWELL_MS : PAGER_TUNED_FAST_DWELL_MS) :
+                              slow ? 2*pager_calm_dwell_ms : pager_calm_dwell_ms;
         for (unsigned n=0; tail!=head && now-queue[tail].at>=dwell && n<out_cap; ++n) {
             const uintptr_t chunk=queue[tail].chunk;
             tail=(tail+1)%QUEUE;
@@ -1679,7 +1784,12 @@ static void pager_start(void) {
         return;
     }
     const long high_mb=pager_setting("high=",high ? strtol(high,NULL,10) : 0);
-    pager_high=high_mb>0 ? (uint64_t)high_mb<<20 : pager_limit-((uint64_t)PAGER_HIGH_BELOW_LIMIT_MB<<20);
+    pager_high=high_mb>0 ? (uint64_t)high_mb<<20 :
+        pager_limit-((uint64_t)(pager_old ? PAGER_OLD_HIGH_BELOW_LIMIT_MB : PAGER_HIGH_BELOW_LIMIT_MB)<<20);
+    printf("Pager: %s thresholds (pager_tune.py 2026-11-27; BB_PAGER_OLD)\n",pager_old ? "old" : "tuned");
+    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); pager_qpc_us=(double)f.QuadPart/1e6; }
+    printf("Pager: cached read-ahead %d chunks forward, %d back, cache %d MiB (pager_cache_ahead.py; pager.txt ahead= cache=)\n",
+           pager_ahead,pager_ahead/4,pager_cache_mib);
     pager_low=pager_high-(UINT64_C(256)<<20);
     if (!AddVectoredExceptionHandler(1,pager_fault)) { printf("Pager: off (no fault handler)\n"); return; }
     /* make-room's copy buffer exists before memory is tight (allocating it then could fail) */
@@ -1708,10 +1818,12 @@ void runtime_memory_report_pager(void) {
     if (!pager_active) return;
     const LONG64 ins=pager_page_ins;
     printf("Pager: %lld MiB in the file; out %lld MiB, back %lld MiB (%lld us each), stopped by a touch %lld, swept %lld, "
-           "touched while swept %lld, let go %lld, views %lld, failed %lld; app memory %llu MiB (above %llu MiB it pages)\n",
+           "touched while swept %lld, let go %lld, views %lld, failed %lld; cache hits %lld of %lld cached, page-in %lld us of which disk read %lld us; app memory %llu MiB (above %llu MiB it pages)\n",
            (long long)(pager_in_file*64/1024),(long long)(pager_evicted*64/1024),(long long)(ins*64/1024),
            (long long)(ins ? pager_page_in_us/ins : 0),(long long)pager_aborted,(long long)pager_swept,(long long)pager_touched,
            (long long)pager_released,(long long)pager_views,(long long)pager_failed,
+           (long long)pager_cache_hits,(long long)pager_cache_filled,
+           (long long)(pager_timed ? pager_total_us/pager_timed : 0),(long long)(pager_timed ? pager_read_us/pager_timed : 0),
            (unsigned long long)(pager_app_usage()>>20),(unsigned long long)(pager_high>>20));
 }
 
@@ -2325,6 +2437,135 @@ uint64_t runtime_memory_trim_zero_private(uint64_t scan_bytes) {
     (void)scan_bytes;return 0;
 #endif
 }
+/* XStation 2026-11-23 (private_write.py): GPU writes into a private chunk, in place. NtWriteVirtualMemory
+ * (not WriteProcessMemory: that one changes the page protection and restores it, racing the GPU tracker's own
+ * protection changes; f2-fix hung at boot like the guarded promotion did) fails on a read-only or no-access page
+ * instead of faulting or touching protections; such writes promote the chunk as before (counted). */
+typedef LONG (NTAPI *BbNtWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+static BbNtWriteVirtualMemory bb_nt_write;
+static volatile LONG64 private_direct_writes, private_direct_fallbacks, private_direct_ro, private_direct_noaccess;
+static int private_direct=-1;
+static volatile LONG64 private_direct_opened;
+/* host_protect (the GPU tracker's protection changes) and the read-only case below take this lock: a page
+ * opened for a GPU write is closed again before the tracker can change it, so no stale protection is restored. */
+static SRWLOCK private_protect_lock=SRWLOCK_INIT; /* tentatively declared at host_protect */
+
+static volatile LONG64 private_direct_raced;
+static SRWLOCK private_race_lock=SRWLOCK_INIT;
+static CONDITION_VARIABLE private_race_wake=CONDITION_VARIABLE_INIT;
+static uintptr_t private_race_pages[1024]; static unsigned private_race_head, private_race_tail;
+static DWORD WINAPI private_race_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        AcquireSRWLockExclusive(&private_race_lock);
+        while (private_race_head==private_race_tail) SleepConditionVariableSRW(&private_race_wake,&private_race_lock,INFINITE,0);
+        const uintptr_t page=private_race_pages[private_race_tail++%1024];
+        ReleaseSRWLockExclusive(&private_race_lock);
+        MEMORY_BASIC_INFORMATION info;
+        if (VirtualQuery((void*)page,&info,sizeof(info)) && info.State==MEM_COMMIT &&
+            ((info.Protect&0xff)==PAGE_READONLY || (info.Protect&0xff)==PAGE_READWRITE))
+            __atomic_fetch_or((volatile uint32_t*)page,0u,__ATOMIC_SEQ_CST); /* a write: faults to the tracker if watched */
+    }
+    return 0;
+}
+static void private_race_queue(uintptr_t page) {
+    static volatile LONG started;
+    if (!InterlockedExchange(&started,1)) { HANDLE h=CreateThread(NULL,0,private_race_thread,NULL,0,NULL); if (h) CloseHandle(h); }
+    AcquireSRWLockExclusive(&private_race_lock);
+    if (private_race_head-private_race_tail<1024) private_race_pages[private_race_head++%1024]=page;
+    ReleaseSRWLockExclusive(&private_race_lock);
+    WakeConditionVariable(&private_race_wake);
+}
+static int bb_private_write(size_t r, uintptr_t at, const unsigned char *src, uint64_t n) {
+    if (private_direct<0) {
+        const char *v=getenv("BB_PRIVATE_DIRECT_WRITE");
+        HMODULE nt=GetModuleHandleW(L"ntdll.dll");
+        bb_nt_write=nt ? (BbNtWriteVirtualMemory)(void*)GetProcAddress(nt,"NtWriteVirtualMemory") : NULL;
+        private_direct=!(v && v[0]=='0') && bb_nt_write;
+        printf("Runtime: GPU writes into private chunks %s (BB_PRIVATE_DIRECT_WRITE%s)\n",private_direct ? "in place" : "promote the chunk",
+               bb_nt_write ? "" : "; NtWriteVirtualMemory missing");
+        fflush(stdout);
+    }
+    if (!private_direct) return 0;
+    pager_bring_back(at,at+n);
+    if (regions[r].mapped!=2) return 0;
+    for (uintptr_t p=at&~(uintptr_t)(private_touch_page-1); p<at+n; p+=private_touch_page) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery((void*)p,&info,sizeof(info))) return 0;
+        if (info.State==MEM_RESERVE && !bb_commit_retry((void*)p,private_touch_page,regions[r].initial_protect)) return 0;
+    }
+    SIZE_T done=0;
+    LONG status=bb_nt_write(GetCurrentProcess(),(void*)at,(void*)src,(SIZE_T)n,&done);
+    if (status<0 || done!=n) {
+        /* 2026-11-23 (wm1: 845 promotions from read-only fallbacks, one lost 7 bytes of commands = a "splice"):
+         * read-only pages (GPU tracker watch) are opened under the protection lock, written, closed. */
+        /* retried: a page can change between the query and the write (pager sweep, the write watch) */
+        for (int attempt=0; attempt<16 && (status<0 || done!=n); ++attempt) {
+        if (attempt) { pager_bring_back(at,at+n); if (regions[r].mapped!=2) return 0; SwitchToThread(); }
+        uintptr_t runs[32][2]; unsigned char *snaps[32]; int count=0, ok=1;
+        AcquireSRWLockExclusive(&private_protect_lock);
+        for (uintptr_t q=at; q<at+n && ok;) {
+            MEMORY_BASIC_INFORMATION info;
+            if (!VirtualQuery((void*)q,&info,sizeof(info)) || info.State!=MEM_COMMIT) { ok=0; break; }
+            uintptr_t e=(uintptr_t)info.BaseAddress+info.RegionSize; if (e>at+n) e=at+n;
+            const DWORD base=info.Protect&0xff;
+            if (base==PAGE_READONLY) {
+                const uintptr_t a=q&~(uintptr_t)4095, b=(e+4095)&~(uintptr_t)4095;
+                DWORD old;
+                if (count==32) { ok=0; break; }
+                snaps[count]=(b-a<=(1u<<20)) ? malloc(b-a) : NULL; /* what the page held before it was opened */
+                if (snaps[count]) memcpy(snaps[count],(const void*)a,b-a);
+                if (!VirtualProtect((void*)a,b-a,PAGE_READWRITE,&old)) { free(snaps[count]); ok=0; break; }
+                runs[count][0]=a; runs[count][1]=b; ++count;
+            } else if (base!=PAGE_READWRITE && base!=PAGE_EXECUTE_READWRITE) { ok=0; break; }
+            q=e;
+        }
+        if (ok) { done=0; status=bb_nt_write(GetCurrentProcess(),(void*)at,(void*)src,(SIZE_T)n,&done); }
+        for (int k=0;k<count;++k) {
+            MEMORY_BASIC_INFORMATION info; DWORD old;
+            if (VirtualQuery((void*)runs[k][0],&info,sizeof(info)) && info.Protect==PAGE_READWRITE)
+                VirtualProtect((void*)runs[k][0],runs[k][1]-runs[k][0],PAGE_READONLY,&old);
+        }
+        ReleaseSRWLockExclusive(&private_protect_lock);
+        const int wrote=ok && status>=0 && done==n;
+        for (int k=0;k<count;++k) { /* other writes that landed while the page was open */
+            for (uintptr_t pg=runs[k][0]; pg<runs[k][1]; pg+=4096) {
+                int changed=!snaps[k];
+                const unsigned char *now=(const unsigned char*)pg, *before=snaps[k] ? snaps[k]+(pg-runs[k][0]) : NULL;
+                for (size_t i=0;i<4096 && !changed;++i) {
+                    const uintptr_t x=pg+i;
+                    const unsigned char want=(wrote && x>=at && x<at+n) ? src[x-at] : before[i];
+                    changed=now[i]!=want;
+                }
+                if (changed) {
+                    const LONG64 c=_InterlockedIncrement64(&private_direct_raced);
+                    if (!(c&(c-1))) { printf("Private write: %lld pages changed by another writer while opened for a GPU write (last %p); handed to the GPU tracker\n",(long long)c,(void*)pg); fflush(stdout); }
+                    private_race_queue(pg);
+                }
+            }
+            free(snaps[k]);
+        }
+        if (wrote) { _InterlockedIncrement64(&private_direct_opened); goto written; }
+        if (!ok) status=-1;
+        }
+    }
+    if (status<0 || done!=n) {
+        MEMORY_BASIC_INFORMATION info; DWORD protect=0;
+        if (VirtualQuery((void*)(at+done),&info,sizeof(info))) protect=info.Protect;
+        if ((protect&0xff)==PAGE_READONLY || (protect&0xff)==PAGE_EXECUTE_READ) _InterlockedIncrement64(&private_direct_ro);
+        else if ((protect&0xff)==PAGE_NOACCESS) _InterlockedIncrement64(&private_direct_noaccess);
+        const LONG64 f=_InterlockedIncrement64(&private_direct_fallbacks);
+        if (!(f&(f-1))) { printf("Private write: %lld direct, %lld fell back to promotion (%lld read-only, %lld no-access; status %#lx, protect %#lx at %p)\n",
+                                 (long long)private_direct_writes,(long long)f,(long long)private_direct_ro,(long long)private_direct_noaccess,
+                                 (unsigned long)status,(unsigned long)protect,(void*)(at+done)); fflush(stdout); }
+        return 0;
+    }
+written:;
+    const LONG64 w=_InterlockedIncrement64(&private_direct_writes);
+    if (!(w&(w-1)) && w<=(1<<24)) { printf("Private write: %lld direct (%lld through read-only pages), %lld fell back to promotion (%lld read-only, %lld no-access)\n",(long long)w,
+                                           (long long)private_direct_opened,(long long)private_direct_fallbacks,(long long)private_direct_ro,(long long)private_direct_noaccess); fflush(stdout); }
+    return 1;
+}
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
     read_lock();
     int ok=1;
@@ -2337,6 +2578,8 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
             size_t r=region_index(at);
             if(r<region_count && regions[r].start<=at) {
                 if(n>regions[r].end-at)n=regions[r].end-at;
+                /* XStation 2026-11-23 (private_write.py): in place, no promotion copy that loses concurrent writes */
+                if(regions[r].mapped==2 && bb_private_write(r,at,(const unsigned char *)data+(at-address),n)) { at+=n; continue; }
                 if(regions[r].mapped==2)private_promote(r);
             }
         }

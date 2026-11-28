@@ -9,6 +9,9 @@
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 
+extern thread_local bool g_shader_prebuild_test;
+extern thread_local const void* g_shader_fake_fetch;
+
 namespace Shader::Gcn {
 
 /**
@@ -52,6 +55,11 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
+    }
+    // XStation 2026-11-16: the game makes fetch shaders; without it, the recorded one.
+    if (g_shader_prebuild_test) {
+        return g_shader_fake_fetch ? *static_cast<const FetchShaderData*>(g_shader_fake_fetch)
+                                   : FetchShaderData{};
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);

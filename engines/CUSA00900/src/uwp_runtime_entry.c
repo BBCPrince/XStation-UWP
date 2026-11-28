@@ -25,6 +25,22 @@ static int setting(const char* name, const char* value) {
     return _putenv_s(name, value) == 0 && SetEnvironmentVariableA(name, value);
 }
 
+/* XStation 2026-11-16 (test switch): pipeline-cache-namespace.txt in the title folder names another cache
+ * folder (letters, digits, - and _), so a first start can be tested without the player's own cache. */
+static int cache_namespace_test(const char* local) {
+    char path[32768], name[80] = {0};
+    snprintf(path,sizeof(path),"%s\\pipeline-cache-namespace.txt",local);
+    FILE *f=fopen(path,"r");
+    if(!f) return 1;
+    if(!fgets(name,sizeof(name),f)) name[0]=0;
+    fclose(f);
+    name[strcspn(name,"\r\n ")]=0;
+    for(const char *c=name;*c;++c) if(!((*c>='a'&&*c<='z')||(*c>='A'&&*c<='Z')||(*c>='0'&&*c<='9')||*c=='-'||*c=='_')) return 1;
+    if(!name[0]) return 1;
+    printf("UWP: pipeline cache folder %s (pipeline-cache-namespace.txt)\n",name);
+    return setting("BB_PIPELINE_CACHE_NAMESPACE",name);
+}
+
 __declspec(dllexport) const char* __cdecl bb_uwp_runtime_identity(void) {
     return "Bloodborne native runtime; UWP renderer integration 1; GPL-2.0-or-later";
 }
@@ -437,6 +453,7 @@ __declspec(dllexport) int __cdecl bb_uwp_run_game(const char *local,const char *
         fclose(scene_patch);
     }
     snprintf(game,sizeof(game),"%s\\%s",packaged,update_109 ? "GameData109" : "GameData");
+    if(!setting("BB_APP0_DIR",game))return 5; /* XStation 2026-11-16: the cache recipe reads the game's shaders */
     char save_profile_path[32768],save_profile[32]={0};
     snprintf(save_profile_path,sizeof(save_profile_path),"%s\\save-profile.txt",local);
     FILE *save_profile_file=fopen(save_profile_path,"r");
@@ -466,6 +483,13 @@ __declspec(dllexport) int __cdecl bb_uwp_run_game(const char *local,const char *
     snprintf(capture_trigger,sizeof(capture_trigger),"%s\\frame-capture.txt",local);
     if (_mkdir(capture_dir) && errno!=EEXIST) return 5;
     if (!setting("BB_FRAME_DUMP_TRIGGER",capture_trigger) || !setting("BB_DUMP_DIR",capture_dir)) return 5;
+    /* XStation 2026-11-21 (capture_env.py): the frame analyzer: frame-analyze.txt records the next frame's passes. */
+    {
+        char analyze_trigger[32768];
+        snprintf(analyze_trigger,sizeof(analyze_trigger),"%s\\frame-analyze.txt",local);
+        if (!setting("BB_CAPTURE_TRIGGER",analyze_trigger) || !setting("BB_CAPTURE_DIR",capture_dir) ||
+            !setting("BB_DIAGNOSTIC_IMAGE_DIR",capture_dir)) return 5;
+    }
     FILE *file=fopen(boot,"rb");
     if (!file) { fprintf(stderr,"UWP: prepared game image is not readable: %s (%d)\n",boot,errno); return 2; }
     fclose(file);
@@ -473,7 +497,7 @@ __declspec(dllexport) int __cdecl bb_uwp_run_game(const char *local,const char *
         !setting("BB_CONFIG",config) || !setting("BB_FPS_LIMIT","0") || !setting("BB_VBLANK_HZ","0") ||
         !setting("BB_OBJECT_MOTION","0") ||
         !setting("BB_UPLOAD_SUBMIT_MB","32") ||
-        !setting("BB_ONLINE","0") || !setting("BB_PIPELINE_CACHE_NAMESPACE","uwp-mesa-startup-v1") || !setting("BB_VK_VALIDATION","0") ||
+        !setting("BB_ONLINE","0") || !setting("BB_PIPELINE_CACHE_NAMESPACE","uwp-mesa-startup-v1") || !cache_namespace_test(local) || !setting("BB_VK_VALIDATION","0") ||
         !setting("BB_DUMP_SHADERS","0") || !setting("BB_TRACE_MUTEX","0") || !setting("VK_LOADER_DEBUG","error,warn")) return 5;
     {
         /* bbport (Xbox, 2026-10-27): frame-limit.txt selects a paced 30 FPS mode at launch. */

@@ -9,6 +9,10 @@
 #include "video_core/texture_cache/image_view.h"
 
 #include <magic_enum/magic_enum.hpp>
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <utility>
 
 namespace VideoCore {
 
@@ -89,6 +93,50 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::De
     type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
 }
 
+// XStation 2026-11-21: the D3D12 typeless family a format casts within (0 = not listed: left alone).
+static int BbCastFamily(vk::Format f) {
+    using F = vk::Format;
+    switch (f) {
+    case F::eR32Sfloat: case F::eR32Uint: case F::eR32Sint: case F::eD32Sfloat:
+        return 1;
+    case F::eR8G8B8A8Unorm: case F::eR8G8B8A8Snorm: case F::eR8G8B8A8Uint: case F::eR8G8B8A8Sint:
+    case F::eR8G8B8A8Srgb: case F::eB8G8R8A8Unorm: case F::eB8G8R8A8Srgb: case F::eB8G8R8A8Snorm:
+    case F::eB8G8R8A8Uint: case F::eB8G8R8A8Sint: case F::eA8B8G8R8UnormPack32: case F::eA8B8G8R8SnormPack32:
+    case F::eA8B8G8R8UintPack32: case F::eA8B8G8R8SintPack32: case F::eA8B8G8R8SrgbPack32:
+        return 2;
+    case F::eR16G16Unorm: case F::eR16G16Snorm: case F::eR16G16Uint: case F::eR16G16Sint: case F::eR16G16Sfloat:
+        return 3;
+    case F::eA2B10G10R10UnormPack32: case F::eA2B10G10R10UintPack32: case F::eA2R10G10B10UnormPack32:
+    case F::eA2R10G10B10UintPack32:
+        return 4;
+    case F::eB10G11R11UfloatPack32:
+        return 5;
+    case F::eE5B9G9R9UfloatPack32:
+        return 6;
+    case F::eR32G32Sfloat: case F::eR32G32Uint: case F::eR32G32Sint:
+        return 7;
+    case F::eR16G16B16A16Unorm: case F::eR16G16B16A16Snorm: case F::eR16G16B16A16Uint:
+    case F::eR16G16B16A16Sint: case F::eR16G16B16A16Sfloat:
+        return 8;
+    case F::eR16Unorm: case F::eR16Snorm: case F::eR16Uint: case F::eR16Sint: case F::eR16Sfloat: case F::eD16Unorm:
+        return 9;
+    case F::eR8G8Unorm: case F::eR8G8Snorm: case F::eR8G8Uint: case F::eR8G8Sint: case F::eR8G8Srgb:
+        return 10;
+    case F::eR8Unorm: case F::eR8Snorm: case F::eR8Uint: case F::eR8Sint: case F::eR8Srgb:
+        return 11;
+    case F::eR32G32B32A32Sfloat: case F::eR32G32B32A32Uint: case F::eR32G32B32A32Sint:
+        return 12;
+    case F::eR5G6B5UnormPack16: case F::eB5G6R5UnormPack16:
+        return 13;
+    case F::eR5G5B5A1UnormPack16: case F::eB5G5R5A1UnormPack16: case F::eA1R5G5B5UnormPack16:
+        return 14;
+    case F::eR4G4B4A4UnormPack16: case F::eB4G4R4A4UnormPack16:
+        return 15;
+    default:
+        return 0;
+    }
+}
+
 ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info_,
                      const Image& image)
     : info{info_} {
@@ -149,6 +197,25 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
             break;
         default:
             break;
+        }
+    }
+
+    // XStation 2026-11-21 (view_cast.py in Bloodborne-AllocFallback-20261121): the Xbox's D3D12 removes the device on
+    // a view in another cast family than the image (R32_SFLOAT viewed as R8G8B8A8_UNORM on a fast travel).
+    {
+        const vk::Format image_format = image.backing->image.image_ci.format;
+        const int view_family = BbCastFamily(format), image_family = BbCastFamily(image_format);
+        if (view_family && image_family && view_family != image_family) {
+            static std::mutex noted_lock;
+            static std::set<std::pair<int, int>> noted;
+            std::scoped_lock lock{noted_lock};
+            if (noted.emplace(int(format), int(image_format)).second) {
+                std::printf("Image view: %s view of a %s image made as %s (no cast across D3D12 format families)\n",
+                            vk::to_string(format).c_str(), vk::to_string(image_format).c_str(),
+                            vk::to_string(image_format).c_str());
+                std::fflush(stdout);
+            }
+            format = image_format;
         }
     }
 

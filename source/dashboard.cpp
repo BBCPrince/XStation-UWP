@@ -40,6 +40,7 @@
 #include "pkg_extract.h"
 #include "game_prepare.h"
 #include "tlou_assets.h"
+#include "qr_code.h"
 #include <fileapifromapp.h>
 #include <winrt/Windows.Networking.h>
 #include <winrt/Windows.Networking.Connectivity.h>
@@ -461,6 +462,44 @@ struct DashApp : ApplicationT<DashApp> {
                          // 5 a newer XStation on GitHub (A opens its page)
     // XStation 2026-11-17: the newest release of the public repo, when it is newer than this package (CheckForUpdate)
     std::wstring updateTag, updateMine, updateNotes, updateUrl;
+    StackPanel updateQr{nullptr};
+    Border updateQrCode{nullptr};
+    std::wstring updateQrFor;
+    void ShowUpdateQr(bool show) {
+        if (!updateQr) return;
+        if (show && updateQrFor != updateUrl) {
+            updateQrFor = updateUrl;
+            std::string link = winrt::to_string(updateUrl);
+            if (link.size() > 78) link = "https://github.com/BBCPrince/XStation-UWP/releases"; // the encoder holds 78 characters
+            const QrMatrix m = GenerateQrMatrix(link);
+            updateQrCode.Child(nullptr);
+            if (!m.empty()) {
+                constexpr double px = 5; // 33 modules -> 165 px
+                GeometryGroup group;
+                group.FillRule(FillRule::Nonzero);
+                for (int y = 0; y < m.size; ++y) {
+                    for (int x = 0; x < m.size;) { // one rectangle per dark run: no seams between modules
+                        if (!m.at(x, y)) { ++x; continue; }
+                        int end = x;
+                        while (end < m.size && m.at(end, y)) ++end;
+                        RectangleGeometry run;
+                        run.Rect(Windows::Foundation::Rect{float(x * px), float(y * px), float((end - x) * px), float(px + 0.5)});
+                        group.Children().Append(run);
+                        x = end;
+                    }
+                }
+                Windows::UI::Xaml::Shapes::Path path;
+                path.Data(group);
+                path.Fill(Solid(255, 0, 0, 0));
+                path.Width(m.size * px);
+                path.Height(m.size * px);
+                updateQrCode.Child(path);
+            }
+        }
+        const bool visible = show && updateQrCode.Child() != nullptr;
+        updateQr.Visibility(visible ? Visibility::Visible : Visibility::Collapsed);
+        detailsText.Margin(Thickness{0, 0, visible ? 225.0 : 0.0, 0});
+    }
     std::atomic<bool> updateReady{false};
     bool updateTestDev = false;
     bool savesBusy = false;               // a save export or import is running
@@ -1187,6 +1226,23 @@ struct DashApp : ApplicationT<DashApp> {
             Grid both;
             both.Children().Append(detailsText);
             both.Children().Append(BuildDetailsView());
+            // the update box's QR code (ShowUpdateQr): white with a 4-module quiet zone, top right beside the text
+            updateQr = StackPanel();
+            updateQr.HorizontalAlignment(HorizontalAlignment::Right);
+            updateQr.VerticalAlignment(VerticalAlignment::Top);
+            updateQr.Visibility(Visibility::Collapsed);
+            updateQrCode = Border();
+            updateQrCode.Background(White());
+            updateQrCode.Padding(Thickness{20, 20, 20, 20});
+            updateQrCode.CornerRadius(CornerRadius{6, 6, 6, 6});
+            updateQr.Children().Append(updateQrCode);
+            {
+                auto caption = Text(L"Scan with your phone\nto open the release", 12, White(200));
+                caption.TextAlignment(TextAlignment::Center);
+                caption.Margin(Thickness{0, 8, 0, 0});
+                updateQr.Children().Append(caption);
+            }
+            both.Children().Append(updateQr);
             details.Child(both);
         }
         canvas.Children().Append(details);
@@ -1542,10 +1598,12 @@ struct DashApp : ApplicationT<DashApp> {
         details.Visibility(detailsOpen || confirmOpen ? Visibility::Visible : Visibility::Collapsed);
         detailsText.Visibility(confirmOpen ? Visibility::Visible : Visibility::Collapsed);
         if (detailsView) detailsView.Visibility(detailsOpen && !confirmOpen ? Visibility::Visible : Visibility::Collapsed);
+        ShowUpdateQr(confirmOpen && confirmKind == 5);
         if (confirmOpen && confirmKind == 5) {
             detailsText.Text(L"XStation " + updateTag + L" is out. You have " + updateMine + L".\n\nWhat's new:\n" + updateNotes +
                              L"\n\nTo update, download the .msix from the release page and install it with Xbox Device Portal "
                              L"(Apps, Add), like before. Your games and saves stay.\n" + updateUrl +
+                             L"\n\nOr scan the code with your phone to open the page there."
                              L"\n\nA  Open the page          B  Later");
         } else if (confirmOpen && confirmKind == 4 && selected < games.size() && importPick < importChoices.size()) {
             detailsText.Text(L"Import saves for " + games[selected].title + L"?\n\nFrom the USB drive:  XStation\\Saves\\" + games[selected].id +

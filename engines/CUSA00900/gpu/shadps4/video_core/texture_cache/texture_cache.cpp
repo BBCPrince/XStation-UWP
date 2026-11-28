@@ -28,6 +28,9 @@ extern "C" void runtime_memory_report_committed(void);
 
 namespace VideoCore {
 
+extern thread_local bool bb_twin_allowed;
+bool BbNeedsTwin(const Image& image, vk::Format view_format);
+
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 // bbport (2026-10-28): reduced texture detail, for the log.
@@ -287,6 +290,24 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {merged_image_id, -1, -1};
         }
 
+        // XStation 2026-11-21 (twin.py): a render target / storage image in another D3D12 cast family than the
+        // cached one at this address: a new image of its own format (the old one goes when it is idle).
+        if ((binding == BindingType::RenderTarget || binding == BindingType::Storage) &&
+            BbNeedsTwin(cache_image, image_info.pixel_format)) {
+            static std::atomic<int> noted{0};
+            if (noted.fetch_add(1) < 16) {
+                std::printf("Image twin: %s %s target at %#llx gets its own image (cached one is %s)\n",
+                            vk::to_string(image_info.pixel_format).c_str(),
+                            binding == BindingType::Storage ? "storage" : "render",
+                            (unsigned long long)image_info.guest_address,
+                            vk::to_string(cache_image.info.pixel_format).c_str());
+                std::fflush(stdout);
+            }
+            if (safe_to_delete) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
         if (const auto depth_image_id = ResolveDepthOverlap(image_info, binding, cache_image_id)) {
             return {depth_image_id, -1, -1};
         }
@@ -625,6 +646,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
             continue;
         }
+        // XStation 2026-11-21 (twin.py): a write in another D3D12 cast family needs its own image.
+        if ((desc.type == BindingType::RenderTarget || desc.type == BindingType::Storage) &&
+            BbNeedsTwin(cache_image, info.pixel_format)) {
+            continue;
+        }
         image_id = cache_id;
     }
 
@@ -751,6 +777,15 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, ViewMemo* memo,
                                      bool refresh) {
     Image& image = slot_images[image_id];
+    // XStation 2026-11-21 (twin.py): a sampled view in another D3D12 cast family reads a twin; no memo for it.
+    if (refresh && desc.type != BindingType::Storage && !desc.view_info.is_storage &&
+        BbNeedsTwin(image, desc.view_info.format)) {
+        UpdateImage(image_id);
+        bb_twin_allowed = true;
+        ImageView& view = image.FindView(desc.view_info);
+        bb_twin_allowed = false;
+        return view;
+    }
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
@@ -1303,6 +1338,34 @@ void TextureCache::GarbageCollectImages() {
                 trigger_gc_memory = budget / 10 * 7;
                 pressure_gc_memory = budget / 100 * 85;
                 critical_gc_memory = budget / 100 * 95;
+            }
+        }
+    }
+    // XStation 2026-11-21: also by the number of memory objects (see gc_objects.py in Bloodborne-AllocFallback-20261121):
+    // the Xbox refused new D3D12 heaps at about 1,260 of them (each texture is its own) with memory to spare.
+    if (instance.CanReportMemoryUsage()) {
+        static const u64 object_cap = [] {
+            const char* env = std::getenv("BB_GC_OBJECT_CAP");
+            return env ? std::strtoull(env, nullptr, 10) : 600ull; // tenth version: 600 (was 800)
+        }();
+        if (object_cap) {
+            VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+            vmaGetHeapBudgets(instance.GetAllocator(), budgets);
+            u64 objects = 0;
+            for (const auto& budget : budgets) {
+                objects += budget.statistics.blockCount;
+            }
+            if (objects >= object_cap) {
+                const u64 raised = objects >= object_cap + 250 ? pressure_gc_memory : trigger_gc_memory;
+                total_used_memory = std::max<u64>(total_used_memory, raised);
+                static auto object_report = std::chrono::steady_clock::time_point{};
+                const auto now = std::chrono::steady_clock::now();
+                if (now - object_report >= std::chrono::seconds(10)) {
+                    object_report = now;
+                    std::printf("Texture cache: %llu memory objects (cap %llu): idle textures go%s\n",
+                                (unsigned long long)objects, (unsigned long long)object_cap,
+                                objects >= object_cap + 250 ? ", GPU-written ones written back too" : "");
+                }
             }
         }
     }
